@@ -24,8 +24,8 @@
  *   node setup.js --on                 # back to OpenRouter
  *   node setup.js --uninstall          # restore the newest backup
  *   node setup.js --no-verify          # skip the live test request
- *   node setup.js --reliable           # make the pricier model the default (use if a turn
- *                                      # ever runs tools and prints nothing)
+ *   node setup.js --cheap              # use the cheaper model instead of the default
+ *                                      # (text-only: any turn with an image fails)
  *   node setup.js --efficient          # token-saving setup: reply compression + plain
  *                                      # language rules (same as --extras)
  *   node setup.js --extras             # also install caveman + a plain-language CLAUDE.md
@@ -1355,7 +1355,7 @@ function installAutoupdate(settings, sha) {
   state.lastCheck = Date.now();
   // Remember the choices, so an unattended update reapplies them instead of
   // resetting the machine to defaults.
-  state.options = ['--reliable', '--cheap', '--extras', '--efficient', '--usagelog'].filter(hasFlag);
+  state.options = ['--cheap', '--extras', '--efficient', '--usagelog'].filter(hasFlag);
   writeJson(STATE_FILE, state);
 
   ok(`auto-update installed${sha ? ` (pinned at ${sha.slice(0, 7)})` : ''}`);
@@ -1763,16 +1763,16 @@ async function install() {
   // the labels.
   const [cheap, dear] = [first, second].sort((x, y) => blendedPrice(x) - blendedPrice(y));
 
-  // The cheaper model is the default, as intended: everyday work on DeepSeek,
-  // the pricier GLM one /model opus away.
+  // GLM is the default. It is the pricier of the two, but only just, and it is
+  // the one that works: it accepts images, where the cheaper model is text-only
+  // and fails any turn containing one, and it has not dropped a reply in any
+  // test. When this was first written the gap was 3.75x and the cheap model was
+  // the obvious default; repricing narrowed it to about 1.5x and the choice
+  // flipped with it.
   //
-  // Known trade-off, measured on a clean machine: DeepSeek V4 Flash sometimes
-  // ends a tool-using turn with no text block — the tools run and nothing is
-  // printed. GLM did not do this in the same tests. --reliable makes GLM the
-  // default if that ever becomes annoying; MAX_THINKING_TOKENS=0 below reduces
-  // how often it happens.
-  const main = hasFlag('--reliable') ? dear : cheap;
-  const secondary = hasFlag('--reliable') ? cheap : dear;
+  // --cheap opts back into the cheaper model, with both caveats.
+  const main = hasFlag('--cheap') ? cheap : dear;
+  const secondary = hasFlag('--cheap') ? dear : cheap;
   ok(`default -> ${main.id}  ${C.dim}${priceLabel(main)}${C.reset}`);
   ok(`other   -> ${secondary.id}  ${C.dim}${priceLabel(secondary)}${C.reset}`);
   // Pasting a screenshot at a text-only model fails with a 400 that says
@@ -1786,11 +1786,9 @@ async function install() {
     info(alt ? 'or install with --reliable to make that the default' : 'pick an image-capable model in the WANTED table');
   }
 
-  if (!hasFlag('--reliable')) {
-    // The 4-in-10 figure this used to quote came from a broken hook shipped by
-    // this project, and was wrong. Measured again after fixing it: 0/60 at the
-    // API and roughly 1 in 10 through Claude Code.
-    info(`if a tool-using turn ever prints nothing, re-run with --reliable to use ${dear.id}`);
+  if (hasFlag('--cheap')) {
+    info(`${cheap.id} is text-only and occasionally ends a tool-using turn with no reply`);
+    info('drop --cheap to go back to the default');
   }
   for (const m of [first, second]) {
     if (m.matchedBy === 'fuzzy') warn(`${m.id} was a fuzzy match — the exact slug is gone`);

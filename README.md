@@ -68,11 +68,21 @@ miss the extension.
 
 | slot | model | when |
 |---|---|---|
-| default, background | `deepseek/deepseek-v4-flash-0731` | everything — the cheap one |
-| `/model opus` | `z-ai/glm-5.3-flash` | when you want more |
+| default, background | `z-ai/glm-5.3-flash` | everything |
+| `/model opus` | `deepseek/deepseek-v4-flash-0731` | when you want the cheaper one |
 
-$0.04/M in against $0.15/M in, so the default is 3.75x cheaper. Which of the two counts as
-cheap is read from live prices at install time, so a reprice cannot invert the labels.
+$0.09/M in against $0.06/M, so the default costs about 1.5x the alternative. It is the
+default anyway because it is the one that works: it accepts images, where the cheaper model
+is text-only and fails **any turn whose history contains one**, and it has not dropped a
+reply in any test.
+
+When this was first written the gap was 3.75x and the cheap model was the obvious default.
+Repricing narrowed it, and the choice flipped. Which of the two is cheaper is still read
+from live prices at install time, so the labels cannot invert again.
+
+```sh
+node setup.js --key sk-or-v1-... --cheap    # use the cheaper, text-only model instead
+```
 
 **One known rough edge.** DeepSeek occasionally ends a tool-using turn in Claude Code with
 no text at all — the tool runs, the turn ends normally, nothing is printed. Claude Code's
@@ -119,34 +129,29 @@ Edit the `WANTED` table at the top of `setup.js` for different models.
 
 ### Images and screenshots
 
-**The default model cannot accept images.** Pasting a screenshot returns:
+The default model accepts images. The cheaper one does not, and this is the part that
+catches people out: **one image anywhere in the conversation breaks every later turn**, not
+just the turn it was pasted into. Claude Code resends the whole history each turn, so once
+an image is in there the request keeps failing even when your latest message is plain text.
 
-```
-API Error 400: "Could not process image"
-```
+Measured against `deepseek/deepseek-v4-flash-0731`:
 
-That is the model, not the setup. Straight from OpenRouter's catalogue:
-
-| model | accepts |
+| request | result |
 |---|---|
-| `deepseek/deepseek-v4-flash-0731` | `text` |
-| `z-ai/glm-5.3-flash` | `text`, `image`, `video` |
+| text only, no image anywhere | HTTP 200 |
+| image in this turn | HTTP 404 `No endpoints found that support image input` |
+| image in an **earlier** turn, this turn text | HTTP 404 — same failure |
+| image inside a tool result | HTTP 404 — same failure |
 
-Two ways round it:
+If you hit it on `--cheap`, `/clear` gets you working again, because it drops the history
+holding the image.
 
-```
-/model opus          inside Claude Code — switches to the image-capable model for that turn
-```
-
-```sh
-node setup.js --key sk-or-v1-... --reliable    # make the image-capable model the default
-```
-
-The installer now warns about this at install time, and `--doctor` reports
-`images: NOT supported by this model`, rather than leaving you to meet the 400 on your own.
-
-It shows up more on a Mac only because that is where screenshots get pasted; nothing about
-the platform is involved.
+`API Error 400: "Could not process image"` is a **different** error and does not come from
+OpenRouter. Its image failures read differently — `Invalid image data URL in
+messages[].content[].image_url.url` for undecodable data, `Received 404 status code when
+fetching image from URL` for an unreachable one. A 400 with that wording is raised before
+the request leaves the client, so it points at the image itself: too large, or in a format
+Claude Code could not encode.
 
 ### Caching
 
