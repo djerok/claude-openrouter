@@ -24,6 +24,7 @@
  *   node setup.js --on                 # back to OpenRouter
  *   node setup.js --uninstall          # restore the newest backup
  *   node setup.js --no-verify          # skip the live test request
+ *   node setup.js --no-language-hint   # do not add the English-replies note to CLAUDE.md
  *   node setup.js --reliable           # use the pricier model as the default: it accepts
  *                                      # images and does not drop replies
  *   node setup.js --efficient          # token-saving setup: reply compression + plain
@@ -613,6 +614,82 @@ function writeStatusline() {
 // ---------------------------------------------------------------------------
 // Extras: a plain-language CLAUDE.md and the token savers
 // ---------------------------------------------------------------------------
+
+// '[\s\S]' written inside a single-quoted JS string collapses to '[sS]' and
+// matches only the letters s and S. Build it from character codes once and use
+// it everywhere a "any character including newlines" class is needed.
+const ANY_CHAR = '[' + String.fromCharCode(92) + 's' + String.fromCharCode(92) + 'S]';
+const NEWLINE_RE = String.fromCharCode(92) + 'n';
+
+const LANG_BEGIN = '<!-- BEGIN claude-openrouter: language -->';
+const LANG_END = '<!-- END claude-openrouter: language -->';
+
+// Models whose training is heavily Chinese and which drift into it mid-answer.
+// Observed: a reply to an English question about a slash command came back
+// entirely in Chinese, in the visible answer rather than a reasoning block.
+const DRIFTS_LANGUAGE = /^(deepseek|z-ai|qwen|moonshot|baidu|01-ai|tencent)\//i;
+
+const LANG_BODY = [
+  LANG_BEGIN,
+  '# Language',
+  '',
+  'Always write your replies in English, whatever language you reason in.',
+  'This is not a style preference: the configured model is trained heavily on',
+  'Chinese and will otherwise sometimes answer an English question in Chinese.',
+  LANG_END,
+].join(String.fromCharCode(10));
+
+/**
+ * Pin the reply language when the configured model is one that drifts.
+ *
+ * There is no request parameter for this — no env var, nothing in the settings
+ * schema — so an instruction in CLAUDE.md is the only lever available. It is
+ * written in its own marked block, separate from the optional prompt extras, so
+ * it can be removed on its own and does not depend on --extras.
+ */
+function writeLanguageHint(modelId) {
+  if (!DRIFTS_LANGUAGE.test(modelId)) return false;
+
+  let existing = '';
+  try {
+    existing = fs.readFileSync(CLAUDE_MD, 'utf8');
+  } catch {}
+
+  if (existing.includes(LANG_BEGIN)) {
+    const re = new RegExp(escapeRe(LANG_BEGIN) + ANY_CHAR + '*?' + escapeRe(LANG_END), 'g');
+    fs.writeFileSync(CLAUDE_MD, existing.replace(re, LANG_BODY));
+    ok('refreshed the English-replies note in CLAUDE.md');
+    return true;
+  }
+
+  fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+  if (existing.trim()) {
+    backup(CLAUDE_MD);
+    fs.writeFileSync(CLAUDE_MD, existing.replace(/\s*$/, String.fromCharCode(10, 10)) + LANG_BODY + String.fromCharCode(10));
+    ok(`added an English-replies note to ${CLAUDE_MD}`);
+  } else {
+    fs.writeFileSync(CLAUDE_MD, LANG_BODY + String.fromCharCode(10));
+    ok(`wrote ${CLAUDE_MD} with an English-replies note`);
+  }
+  return true;
+}
+
+function removeLanguageHint() {
+  try {
+    const md = fs.readFileSync(CLAUDE_MD, 'utf8');
+    if (!md.includes(LANG_BEGIN)) return;
+    // Built from character classes written out longhand. '[\s\S]' inside a
+    // single-quoted JS string is just '[sS]', which silently matches the letters
+    // s and S and nothing else — the block then survives every uninstall.
+    const re = new RegExp(
+      NEWLINE_RE + '*' + escapeRe(LANG_BEGIN) + ANY_CHAR + '*?' + escapeRe(LANG_END) + NEWLINE_RE + '*',
+      'g'
+    );
+    const stripped = md.replace(re, String.fromCharCode(10));
+    if (stripped.trim()) fs.writeFileSync(CLAUDE_MD, stripped);
+    else fs.unlinkSync(CLAUDE_MD);
+  } catch {}
+}
 
 const CLAUDE_MD_BEGIN = '<!-- BEGIN ccr-openrouter: plain language rules -->';
 const CLAUDE_MD_END = '<!-- END ccr-openrouter -->';
@@ -1716,6 +1793,8 @@ function modeUninstall() {
     writeJson(CLAUDE_SETTINGS, s);
   }
 
+  removeLanguageHint();
+
   for (const f of [STATUSLINE, USAGE_HOOK, AUTOUPDATE]) {
     try {
       fs.unlinkSync(f);
@@ -1823,6 +1902,8 @@ async function install() {
   ok(`${CLAUDE_SETTINGS} -> env.ANTHROPIC_BASE_URL = ${API_ROOT}`);
   info(`default ${cheap.id} | opus slot ${dear.id}`);
   info(`context window ${contextTokens.toLocaleString()} tokens`);
+
+  if (!hasFlag('--no-language-hint')) writeLanguageHint(main.id);
 
   reportMcp();
   if (hasFlag('--efficient')) {
