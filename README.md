@@ -68,21 +68,22 @@ miss the extension.
 
 | slot | model | when |
 |---|---|---|
-| default, background | `z-ai/glm-5.3-flash` | everything |
-| `/model opus` | `deepseek/deepseek-v4-flash-0731` | when you want the cheaper one |
+| default, background | `deepseek/deepseek-v4-flash-0731` | everything — the cheap one |
+| `/model opus` | `z-ai/glm-5.3-flash` | images, or when a turn comes back empty |
 
-$0.09/M in against $0.06/M, so the default costs about 1.5x the alternative. It is the
-default anyway because it is the one that works: it accepts images, where the cheaper model
-is text-only and fails **any turn whose history contains one**, and it has not dropped a
-reply in any test.
+$0.06/M in against $0.09/M, so the default is about a third cheaper. Which of the two counts
+as cheap is read from live prices at install time, so a reprice cannot invert the labels —
+and they have already moved once, from a 3.75x gap to roughly 1.5x.
 
-When this was first written the gap was 3.75x and the cheap model was the obvious default.
-Repricing narrowed it, and the choice flipped. Which of the two is cheaper is still read
-from live prices at install time, so the labels cannot invert again.
+Two things the default cannot do, both covered below: it **cannot accept images**, and it
+occasionally ends a tool-using turn with no reply. Neither applies to the other model:
 
 ```sh
-node setup.js --key sk-or-v1-... --cheap    # use the cheaper, text-only model instead
+node setup.js --key sk-or-v1-... --reliable    # make z-ai/glm-5.3-flash the default instead
 ```
+
+`--cheap` is accepted and does nothing, so a script written while the default was briefly
+the other way round still works.
 
 **One known rough edge.** DeepSeek occasionally ends a tool-using turn in Claude Code with
 no text at all — the tool runs, the turn ends normally, nothing is printed. Claude Code's

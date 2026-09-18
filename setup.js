@@ -24,8 +24,8 @@
  *   node setup.js --on                 # back to OpenRouter
  *   node setup.js --uninstall          # restore the newest backup
  *   node setup.js --no-verify          # skip the live test request
- *   node setup.js --cheap              # use the cheaper model instead of the default
- *                                      # (text-only: any turn with an image fails)
+ *   node setup.js --reliable           # use the pricier model as the default: it accepts
+ *                                      # images and does not drop replies
  *   node setup.js --efficient          # token-saving setup: reply compression + plain
  *                                      # language rules (same as --extras)
  *   node setup.js --extras             # also install caveman + a plain-language CLAUDE.md
@@ -1355,7 +1355,7 @@ function installAutoupdate(settings, sha) {
   state.lastCheck = Date.now();
   // Remember the choices, so an unattended update reapplies them instead of
   // resetting the machine to defaults.
-  state.options = ['--cheap', '--extras', '--efficient', '--usagelog'].filter(hasFlag);
+  state.options = ['--reliable', '--extras', '--efficient', '--usagelog'].filter(hasFlag);
   writeJson(STATE_FILE, state);
 
   ok(`auto-update installed${sha ? ` (pinned at ${sha.slice(0, 7)})` : ''}`);
@@ -1763,16 +1763,15 @@ async function install() {
   // the labels.
   const [cheap, dear] = [first, second].sort((x, y) => blendedPrice(x) - blendedPrice(y));
 
-  // GLM is the default. It is the pricier of the two, but only just, and it is
-  // the one that works: it accepts images, where the cheaper model is text-only
-  // and fails any turn containing one, and it has not dropped a reply in any
-  // test. When this was first written the gap was 3.75x and the cheap model was
-  // the obvious default; repricing narrowed it to about 1.5x and the choice
-  // flipped with it.
+  // The cheaper model is the default: the owner's call, made twice, with the
+  // trade-offs known. It is text-only, so a conversation containing an image
+  // fails from that point on, and it occasionally ends a tool-using turn with
+  // no reply. --reliable swaps in the pricier model, which has neither problem.
   //
-  // --cheap opts back into the cheaper model, with both caveats.
-  const main = hasFlag('--cheap') ? cheap : dear;
-  const secondary = hasFlag('--cheap') ? dear : cheap;
+  // --cheap is accepted and does nothing, so anyone who scripted it while the
+  // default was the other way round is not broken by this.
+  const main = hasFlag('--reliable') ? dear : cheap;
+  const secondary = hasFlag('--reliable') ? cheap : dear;
   ok(`default -> ${main.id}  ${C.dim}${priceLabel(main)}${C.reset}`);
   ok(`other   -> ${secondary.id}  ${C.dim}${priceLabel(secondary)}${C.reset}`);
   // Pasting a screenshot at a text-only model fails with a 400 that says
@@ -1786,9 +1785,8 @@ async function install() {
     info(alt ? 'or install with --reliable to make that the default' : 'pick an image-capable model in the WANTED table');
   }
 
-  if (hasFlag('--cheap')) {
-    info(`${cheap.id} is text-only and occasionally ends a tool-using turn with no reply`);
-    info('drop --cheap to go back to the default');
+  if (!hasFlag('--reliable')) {
+    info(`${cheap.id} occasionally ends a tool-using turn with no reply — --reliable swaps in ${dear.id}`);
   }
   for (const m of [first, second]) {
     if (m.matchedBy === 'fuzzy') warn(`${m.id} was a fuzzy match — the exact slug is gone`);
