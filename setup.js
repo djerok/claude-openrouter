@@ -384,6 +384,13 @@ function blendedPrice(m) {
   return ((Number(p.prompt) || 0) * 3 + (Number(p.completion) || 0)) * 1e6 / 4;
 }
 
+/** Does this model accept image input at all? */
+function takesImages(m) {
+  const a = m.architecture || {};
+  const inputs = a.input_modalities || a.modality || [];
+  return Array.isArray(inputs) ? inputs.includes('image') : /image/.test(String(inputs));
+}
+
 function priceLabel(m) {
   const p = m.pricing || {};
   return `$${((Number(p.prompt) || 0) * 1e6).toFixed(2)}/M in, $${((Number(p.completion) || 0) * 1e6).toFixed(2)}/M out`;
@@ -1619,6 +1626,19 @@ async function modeDoctor() {
   line('base url', env.ANTHROPIC_BASE_URL || 'unset',
     Boolean(env.ANTHROPIC_BASE_URL && env.ANTHROPIC_BASE_URL.includes('openrouter')));
   line('default model', env.ANTHROPIC_MODEL || 'unset', Boolean(env.ANTHROPIC_MODEL));
+  if (env.ANTHROPIC_MODEL) {
+    try {
+      const res = await fetch(MODELS_URL, { signal: AbortSignal.timeout(20000) });
+      if (res.ok) {
+        const all = (await res.json()).data || [];
+        const m = all.find((x) => x.id === env.ANTHROPIC_MODEL);
+        if (m) {
+          const img = takesImages(m);
+          line('images', img ? 'supported' : 'NOT supported by this model', img);
+        }
+      }
+    } catch {}
+  }
   line('statusline', fs.existsSync(STATUSLINE) ? STATUSLINE : 'not present', fs.existsSync(STATUSLINE));
   line('CLAUDE.md', fs.existsSync(CLAUDE_MD) ? CLAUDE_MD : 'not present', fs.existsSync(CLAUDE_MD));
 
@@ -1755,9 +1775,22 @@ async function install() {
   const secondary = hasFlag('--reliable') ? cheap : dear;
   ok(`default -> ${main.id}  ${C.dim}${priceLabel(main)}${C.reset}`);
   ok(`other   -> ${secondary.id}  ${C.dim}${priceLabel(secondary)}${C.reset}`);
+  // Pasting a screenshot at a text-only model fails with a 400 that says
+  // nothing about the model, so say it here instead of letting it be
+  // discovered later.
+  if (!takesImages(main)) {
+    const alt = takesImages(secondary) ? secondary.id : null;
+    warn(`${main.id} cannot accept images — pasting a screenshot returns`);
+    warn('  API Error 400: "Could not process image"');
+    if (alt) info(`for a turn with an image, switch first: /model opus  ->  ${alt}`);
+    info(alt ? 'or install with --reliable to make that the default' : 'pick an image-capable model in the WANTED table');
+  }
+
   if (!hasFlag('--reliable')) {
-    warn(`${cheap.id} drops the reply on about 4 in 10 tool-using turns`);
-    info(`measured over 17 runs; ${dear.id} was 0 in 6. Re-run with --reliable to swap them.`);
+    // The 4-in-10 figure this used to quote came from a broken hook shipped by
+    // this project, and was wrong. Measured again after fixing it: 0/60 at the
+    // API and roughly 1 in 10 through Claude Code.
+    info(`if a tool-using turn ever prints nothing, re-run with --reliable to use ${dear.id}`);
   }
   for (const m of [first, second]) {
     if (m.matchedBy === 'fuzzy') warn(`${m.id} was a fuzzy match — the exact slug is gone`);

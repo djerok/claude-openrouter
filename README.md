@@ -117,6 +117,37 @@ measured request 57 of 63 output tokens were thinking.
 
 Edit the `WANTED` table at the top of `setup.js` for different models.
 
+### Images and screenshots
+
+**The default model cannot accept images.** Pasting a screenshot returns:
+
+```
+API Error 400: "Could not process image"
+```
+
+That is the model, not the setup. Straight from OpenRouter's catalogue:
+
+| model | accepts |
+|---|---|
+| `deepseek/deepseek-v4-flash-0731` | `text` |
+| `z-ai/glm-5.3-flash` | `text`, `image`, `video` |
+
+Two ways round it:
+
+```
+/model opus          inside Claude Code — switches to the image-capable model for that turn
+```
+
+```sh
+node setup.js --key sk-or-v1-... --reliable    # make the image-capable model the default
+```
+
+The installer now warns about this at install time, and `--doctor` reports
+`images: NOT supported by this model`, rather than leaving you to meet the 400 on your own.
+
+It shows up more on a Mac only because that is where screenshots get pasted; nothing about
+the platform is involved.
+
 ### Caching
 
 Automatic, nothing to configure. Per OpenRouter's docs, *"Prompt caching with DeepSeek is
