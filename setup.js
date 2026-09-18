@@ -694,94 +694,9 @@ function removeLanguageHint() {
 const CLAUDE_MD_BEGIN = '<!-- BEGIN ccr-openrouter: plain language rules -->';
 const CLAUDE_MD_END = '<!-- END ccr-openrouter -->';
 
-const CLAUDE_MD_BODY = `${CLAUDE_MD_BEGIN}
-# How to talk to me
-
-Write like you are explaining to a smart 10-year-old. That is the whole rule.
-
-## Words
-
-- Use small words. "Use" not "utilize". "Fix" not "remediate". "Start" not "initiate".
-- Short sentences. One idea each. If a sentence has two ideas, make it two sentences.
-- No jargon unless it is the real name of a real thing. If you must use a hard word,
-  say what it means right after, in the same sentence.
-- Never say "simply", "just", "obviously", or "as you know". If it were obvious I would
-  not be asking.
-
-## Shape
-
-- Answer first. Explain after. Do not warm up.
-- Keep it short. If you can say it in one line, say it in one line.
-- Use a list when there is more than one thing. Use a table when things compare.
-- Show me the command or the code. Do not describe the command in a paragraph.
-
-## When something breaks
-
-1. Say what broke, in one line.
-2. Say why, in one line.
-3. Give me the exact thing to run or type to fix it.
-
-Do not make me read three paragraphs to find the command.
-
-## Being honest
-
-- If you are not sure, say "I am not sure" and say what you would check.
-- If you guessed, say it was a guess.
-- If something failed, say it failed. Do not describe a failure as a success.
-- If you did not do part of the job, say which part.
-
-## Long chats
-
-This chat has a size limit. When it fills up, old parts get thrown away and you forget
-things. Watch for that and warn me **before** it happens, not after.
-
-Tell me to run \`/compact\` when any of these is true:
-
-- we just finished a task and are about to start a different one
-- you pasted or read a lot of long output (a big file, a long log, lots of search results)
-- you notice you are asking me things I already told you
-- the chat has been going a long time and is still going
-
-Say it in one line, like this:
-
-> Good time to run \`/compact\` — we just finished the install and the logs took a lot of room.
-
-Then wait. Do not run it yourself and do not nag me twice in a row about it.
-
-## Do not
-
-- Do not apologise more than once.
-- Do not repeat my question back to me.
-- Do not add features I did not ask for.
-- Do not write a summary of what you are about to do, then do it. Just do it.
-${CLAUDE_MD_END}`;
-
-function writeClaudeMd() {
-  let existing = '';
-  try {
-    existing = fs.readFileSync(CLAUDE_MD, 'utf8');
-  } catch {}
-
-  if (existing.includes(CLAUDE_MD_BEGIN)) {
-    const re = new RegExp(
-      escapeRe(CLAUDE_MD_BEGIN) + '[\\s\\S]*?' + escapeRe(CLAUDE_MD_END),
-      'g'
-    );
-    fs.writeFileSync(CLAUDE_MD, existing.replace(re, CLAUDE_MD_BODY));
-    ok(`refreshed the plain-language section of ${CLAUDE_MD}`);
-    return;
-  }
-
-  if (existing.trim()) {
-    backup(CLAUDE_MD);
-    fs.writeFileSync(CLAUDE_MD, existing.replace(/\s*$/, '\n\n') + CLAUDE_MD_BODY + '\n');
-    ok(`appended a plain-language section to your existing ${CLAUDE_MD}`);
-  } else {
-    fs.mkdirSync(CLAUDE_DIR, { recursive: true });
-    fs.writeFileSync(CLAUDE_MD, CLAUDE_MD_BODY + '\n');
-    ok(`wrote ${CLAUDE_MD}`);
-  }
-}
+// The style rules that used to live here were removed at the owner request.
+// CLAUDE_MD_BEGIN/END above are kept deliberately: an install still strips the
+// block from any machine that already received it.
 
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -1914,9 +1829,6 @@ async function install() {
   }
 
   if (extras) {
-    say('Writing plain-language instructions');
-    writeClaudeMd();
-
     say('Token savers');
     installRtk();
   }

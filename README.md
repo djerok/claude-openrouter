@@ -273,26 +273,39 @@ plus the system prompt plus every tool schema. Twenty turns over a 40k context b
 800k input by itself. `--usage` shows how much of that the provider's cache absorbed and how
 much fixed overhead each turn carries.
 
-## Prompt extras — off by default
+## What it writes to CLAUDE.md
 
-Two optional pieces change *how the model is instructed*: a bundled prompt-compression hook
-(caveman) and a plain-language `CLAUDE.md`. **Both are off unless you ask for them.**
+A default install adds one marked block, seven lines, and nothing else:
 
-```sh
-node setup.js --key sk-or-v1-... --extras
+```markdown
+<!-- BEGIN claude-openrouter: language -->
+# Language
+
+Always write your replies in English, whatever language you reason in.
+<!-- END claude-openrouter: language -->
 ```
 
-They are off because on a small model they were observed producing turns that ran tools and
-then printed nothing at all — the work happened, the answer did not. Instructions that can
-cost you the reply are not a sensible default.
+It is there because both models come from Chinese labs and occasionally answer an English
+question in Chinese. No request parameter controls that, so an instruction is the only lever.
+It is written only when the configured model is from a family that drifts, `--no-language-hint`
+skips it, and `--uninstall` removes it.
 
-Installing without `--extras` actively removes them if a previous run put them there: the
-hooks are unregistered and the `CLAUDE.md` block is stripped, leaving anything you wrote
-around it. Files are deleted **only** when byte-identical to the bundled copy — if you have
-your own build of these hooks, it is left on disk and reported, not removed.
+**No style or tone rules are written.** An earlier version added a long "write like you are
+explaining to a smart 10-year-old" section; it is gone, and installing now *removes* it from
+any machine that received it. Anything you wrote in `CLAUDE.md` yourself is left alone —
+only the marked blocks are touched.
 
-What stays on by default is passive: routing, the version display, and usage logging. None
-of it touches the prompt.
+That matters for cost as well as taste: `CLAUDE.md` is in context on every request whatever
+you are doing, and Anthropic's guidance is to keep it under 200 lines.
+
+## Prompt extras — off by default
+
+`--extras` (or `--efficient`) installs the bundled reply-compression hook, and rtk if you
+have supplied a source for it. It no longer writes anything to `CLAUDE.md`.
+
+Installing without it removes the hook again: unregistered from `settings.json`, and the
+files deleted only when byte-identical to the bundled copies, so a version you edited
+yourself is left on disk untouched.
 
 ## It starts itself, and keeps itself current
 
