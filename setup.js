@@ -5,8 +5,8 @@
  * Works for the CLI and the VSCode extension at once, because both read the
  * `env` block in ~/.claude/settings.json.
  *
- *     default / background : the cheaper of the two models
- *     opus slot            : the pricier one, for when you ask it to think
+ *     default / background : WANTED.a
+ *     opus slot            : WANTED.b, for /model opus
  *
  * There is no proxy, no daemon and no background service. OpenRouter serves the
  * Anthropic Messages API natively at https://openrouter.ai/api/v1/messages, so
@@ -25,8 +25,7 @@
  *   node setup.js --uninstall          # restore the newest backup
  *   node setup.js --no-verify          # skip the live test request
  *   node setup.js --no-language-hint   # do not add the English-replies note to CLAUDE.md
- *   node setup.js --reliable           # use the pricier model as the default: it accepts
- *                                      # images and does not drop replies
+ *   node setup.js --reliable           # use the pricier of the two models as the default
  *   node setup.js --efficient          # token-saving setup: reply compression + plain
  *                                      # language rules (same as --extras)
  *   node setup.js --extras             # also install caveman + a plain-language CLAUDE.md
@@ -58,16 +57,19 @@ const { execFileSync, spawnSync } = require('child_process');
 // Checked against the live catalogue at install time. If a slug is retired, the
 // fuzzy terms find the closest surviving model rather than writing a config
 // that fails on the first prompt.
+//
+// a is the default, b is /model opus. That is the owner's choice, not a price
+// ranking: MiMo is the pricier of the two and is still the default.
 const WANTED = {
   a: {
-    label: 'DeepSeek V4 Flash 0731',
-    slug: 'deepseek/deepseek-v4-flash-0731',
-    fuzzy: ['deepseek', 'flash', '0731'],
+    label: 'MiMo V2.6 Pro',
+    slug: 'xiaomi/mimo-v2.6-pro',
+    fuzzy: ['mimo', 'v2.6', 'pro'],
   },
   b: {
-    label: 'GLM 5.3 Flash',
-    slug: 'z-ai/glm-5.3-flash',
-    fuzzy: ['glm', '5.3', 'flash'],
+    label: 'GPT-6 Luna',
+    slug: 'openai/gpt-6-luna',
+    fuzzy: ['gpt-6', 'luna'],
   },
 };
 
@@ -423,18 +425,18 @@ function pickModel(catalogue, want) {
  * working across upgrades instead of silently falling back to a Claude model
  * the key cannot buy.
  */
-function routingEnv(key, cheap, dear, contextTokens) {
+function routingEnv(key, main, opus, contextTokens) {
   return {
     ANTHROPIC_BASE_URL: API_ROOT,
     ANTHROPIC_AUTH_TOKEN: key,
     ANTHROPIC_API_KEY: '',
-    ANTHROPIC_MODEL: cheap,
-    ANTHROPIC_DEFAULT_MODEL: cheap,
-    ANTHROPIC_SMALL_FAST_MODEL: cheap,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: cheap,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: cheap,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: dear,
-    CLAUDE_CODE_SUBAGENT_MODEL: cheap,
+    ANTHROPIC_MODEL: main,
+    ANTHROPIC_DEFAULT_MODEL: main,
+    ANTHROPIC_SMALL_FAST_MODEL: main,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: main,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: main,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
+    CLAUDE_CODE_SUBAGENT_MODEL: main,
     API_TIMEOUT_MS: '600000',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
     // Claude Code only knows the context window of models in its own catalogue.
@@ -459,7 +461,7 @@ function routingEnv(key, cheap, dear, contextTokens) {
 
 const ROUTING_KEYS = Object.keys(routingEnv('', '', '', 0));
 
-function writeClaudeSettings(key, cheap, dear, contextTokens, mutate) {
+function writeClaudeSettings(key, main, opus, contextTokens, mutate) {
   const prev = readJson(CLAUDE_SETTINGS, {});
   const bak = backup(CLAUDE_SETTINGS);
 
@@ -468,7 +470,7 @@ function writeClaudeSettings(key, cheap, dear, contextTokens, mutate) {
   if (typeof env.ANTHROPIC_BASE_URL === 'string' && /127\.0\.0\.1|localhost/.test(env.ANTHROPIC_BASE_URL)) {
     info('replacing a stale local proxy URL from an older install');
   }
-  Object.assign(env, routingEnv(key, cheap, dear, contextTokens));
+  Object.assign(env, routingEnv(key, main, opus, contextTokens));
 
   const next = { ...prev, env };
   next.statusLine = { type: 'command', command: `"${process.execPath}" "${STATUSLINE}"`, padding: 0 };
@@ -494,7 +496,7 @@ const STATUSLINE_SOURCE = String.raw`#!/usr/bin/env node
  *
  * Reads the documented status line payload on stdin and prints one line:
  *
- *   ● glm-5.3-flash (cheap) | ctx 12% | cache 91% | proj | main | v59f677b
+ *   ● mimo-v2.6-pro (default) | ctx 12% | cache 91% | proj | main | v59f677b
  *
  * Every field here is one Claude Code documents for status lines
  * (context_window.used_percentage, prompt_cache.hit_ratio, cost.total_cost_usd,
@@ -533,8 +535,8 @@ function main() {
   const looksClaude = /^claude[-.]/i.test(reported);
   const model = routed ? (looksClaude ? configured : reported || configured) : reported || 'anthropic';
   const short = String(model).split('/').pop() || '?';
-  const dear = env.ANTHROPIC_DEFAULT_OPUS_MODEL || '';
-  const tier = routed && dear && model === dear ? 'dear' : routed ? 'cheap' : 'anthropic';
+  const opus = env.ANTHROPIC_DEFAULT_OPUS_MODEL || '';
+  const tier = routed && opus && model === opus ? 'opus' : routed ? 'default' : 'anthropic';
 
   const parts = [];
 
@@ -1754,18 +1756,13 @@ async function install() {
   const second = pickModel(catalogue, WANTED.b);
 
   // Cheap vs expensive still comes from live prices, so a reprice cannot invert
-  // the labels.
+  // the labels. Price does not pick the default, though: WANTED.a does.
   const [cheap, dear] = [first, second].sort((x, y) => blendedPrice(x) - blendedPrice(y));
 
-  // The cheaper model is the default: the owner's call, made twice, with the
-  // trade-offs known. It is text-only, so a conversation containing an image
-  // fails from that point on, and it occasionally ends a tool-using turn with
-  // no reply. --reliable swaps in the pricier model, which has neither problem.
-  //
-  // --cheap is accepted and does nothing, so anyone who scripted it while the
-  // default was the other way round is not broken by this.
-  const main = hasFlag('--reliable') ? dear : cheap;
-  const secondary = hasFlag('--reliable') ? cheap : dear;
+  // --reliable still means "the pricier model as the default", and --cheap is
+  // accepted and does nothing, so anyone who scripted either is not broken.
+  const main = hasFlag('--reliable') ? dear : first;
+  const secondary = main === first ? second : first;
   ok(`default -> ${main.id}  ${C.dim}${priceLabel(main)}${C.reset}`);
   ok(`other   -> ${secondary.id}  ${C.dim}${priceLabel(secondary)}${C.reset}`);
   // Pasting a screenshot at a text-only model fails with a 400 that says
@@ -1779,9 +1776,6 @@ async function install() {
     info(alt ? 'or install with --reliable to make that the default' : 'pick an image-capable model in the WANTED table');
   }
 
-  if (!hasFlag('--reliable')) {
-    info(`${cheap.id} occasionally ends a tool-using turn with no reply — --reliable swaps in ${dear.id}`);
-  }
   for (const m of [first, second]) {
     if (m.matchedBy === 'fuzzy') warn(`${m.id} was a fuzzy match — the exact slug is gone`);
   }
@@ -1804,7 +1798,7 @@ async function install() {
   );
   const sha = await currentSha();
   const cavemanSrc = extras ? await ensureCavemanFiles() : null;
-  writeClaudeSettings(key, cheap.id, dear.id, contextTokens, (settings) => {
+  writeClaudeSettings(key, main.id, secondary.id, contextTokens, (settings) => {
     if (extras) installCaveman(settings, cavemanSrc);
     else removePromptExtras(settings);
     // Opt-in. It is only accounting, and it has already cost two user-visible
@@ -1815,7 +1809,7 @@ async function install() {
     if (!hasFlag('--no-autoupdate')) installAutoupdate(settings, sha);
   });
   ok(`${CLAUDE_SETTINGS} -> env.ANTHROPIC_BASE_URL = ${API_ROOT}`);
-  info(`default ${cheap.id} | opus slot ${dear.id}`);
+  info(`default ${main.id} | opus slot ${secondary.id}`);
   info(`context window ${contextTokens.toLocaleString()} tokens`);
 
   if (!hasFlag('--no-language-hint')) writeLanguageHint(main.id);

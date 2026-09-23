@@ -46,8 +46,8 @@ integration is a handful of environment variables in `~/.claude/settings.json`:
 "env": {
   "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
   "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-...",
-  "ANTHROPIC_MODEL": "deepseek/deepseek-v4-flash-0731",
-  "ANTHROPIC_DEFAULT_OPUS_MODEL": "z-ai/glm-5.3-flash"
+  "ANTHROPIC_MODEL": "xiaomi/mimo-v2.6-pro",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL": "openai/gpt-6-luna"
 }
 ```
 
@@ -68,24 +68,20 @@ miss the extension.
 
 | slot | model | when |
 |---|---|---|
-| default, background | `deepseek/deepseek-v4-flash-0731` | everything — the cheap one |
-| `/model opus` | `z-ai/glm-5.3-flash` | images, or when a turn comes back empty |
+| default, background | `xiaomi/mimo-v2.6-pro` | everything |
+| `/model opus` | `openai/gpt-6-luna` | the alternative |
 
-$0.06/M in against $0.09/M, so the default is about a third cheaper. Which of the two counts
-as cheap is read from live prices at install time, so a reprice cannot invert the labels —
-and they have already moved once, from a 3.75x gap to roughly 1.5x.
+The default is **not** the cheaper one. MiMo is $0.435/M in, $0.87/M out; Luna is $0.10/M
+in, $0.50/M out (2026-09-22). Slot `a` in the `WANTED` table is the default by choice, and
+price only decides which the installer labels cheap. Both accept images.
 
-Two things the default cannot do, both covered below: it **cannot accept images**, and it
-occasionally ends a tool-using turn with no reply. Neither applies to the other model:
+`--reliable` still means "make the pricier model the default", which with these two is
+already the case. `--cheap` is accepted and does nothing, so scripts written for earlier
+defaults still work.
 
-```sh
-node setup.js --key sk-or-v1-... --reliable    # make z-ai/glm-5.3-flash the default instead
-```
-
-`--cheap` is accepted and does nothing, so a script written while the default was briefly
-the other way round still works.
-
-**One known rough edge.** DeepSeek occasionally ends a tool-using turn in Claude Code with
+**Known rough edge on the previous default.** Everything below was measured on
+`deepseek/deepseek-v4-flash-0731`, the default before 2026-09-22. It has not been measured
+on MiMo or Luna yet. DeepSeek occasionally ended a tool-using turn in Claude Code with
 no text at all — the tool runs, the turn ends normally, nothing is printed. Claude Code's
 debug log shows it exactly:
 
@@ -103,8 +99,7 @@ A normal stop, zero characters of output, after a tool call that succeeded.
 | `z-ai/glm-5.3-flash` through Claude Code | 0/6 |
 
 It does not reproduce against the API at all, so whatever triggers it needs the larger and
-more complex exchange Claude Code really sends. If it bothers you, `--reliable` makes GLM
-the default. Otherwise re-asking works.
+more complex exchange Claude Code really sends. Re-asking worked.
 
 **This number has been wrong twice in this file, in both directions.** It was first
 published as 4 in 10, measured while a hook shipped by this project was failing on every
@@ -130,12 +125,12 @@ Edit the `WANTED` table at the top of `setup.js` for different models.
 
 ### Images and screenshots
 
-The default model accepts images. The cheaper one does not, and this is the part that
-catches people out: **one image anywhere in the conversation breaks every later turn**, not
+Both current models accept images. If you put a text-only model in the `WANTED` table, this
+is the part that catches people out: **one image anywhere in the conversation breaks every later turn**, not
 just the turn it was pasted into. Claude Code resends the whole history each turn, so once
 an image is in there the request keeps failing even when your latest message is plain text.
 
-Measured against `deepseek/deepseek-v4-flash-0731`:
+Measured against `deepseek/deepseek-v4-flash-0731`, the text-only previous default:
 
 | request | result |
 |---|---|
@@ -144,8 +139,8 @@ Measured against `deepseek/deepseek-v4-flash-0731`:
 | image in an **earlier** turn, this turn text | HTTP 404 — same failure |
 | image inside a tool result | HTTP 404 — same failure |
 
-If you hit it on `--cheap`, `/clear` gets you working again, because it drops the history
-holding the image.
+If you hit it, `/clear` gets you working again, because it drops the history holding the
+image.
 
 `API Error 400: "Could not process image"` is a **different** error and does not come from
 OpenRouter. Its image failures read differently — `Invalid image data URL in
@@ -156,17 +151,18 @@ Claude Code could not encode.
 
 ### Caching
 
-Automatic, nothing to configure. Per OpenRouter's docs, *"Prompt caching with DeepSeek is
-automated and does not require any additional configuration"* — same for Z.AI. DeepSeek
-cache reads bill at 0.1x input; Z.AI cache writes are free. `cache_control` breakpoints are
-only needed for Anthropic and Qwen models, which this never routes to.
+Nothing to configure for Luna. Per OpenRouter's docs, *"Prompt caching with OpenAI is
+automated and does not require any additional configuration."* The same page does not
+mention Xiaomi, so whether MiMo caches has not been confirmed — the statusline's cache hit
+rate is the way to check. `cache_control` breakpoints are only needed for Anthropic, Qwen
+and Gemini models, which this never routes to.
 
 ## What the installer does
 
 1. Installs Claude Code if it is missing.
 2. Resolves both model slugs against the **live** catalogue, so a retired model fails at
    install time instead of on your first prompt.
-3. Ranks them by price and assigns the slots.
+3. Puts `WANTED.a` in the default slot and `WANTED.b` in the opus slot.
 4. Writes `~/.claude/settings.json` (backing up whatever was there).
 5. Writes a statusline that names the model actually in use.
 6. Writes a plain-language `~/.claude/CLAUDE.md` — see below.
@@ -211,14 +207,14 @@ which is why one file covers the CLI and the VSCode extension at once:
     "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
     "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-REPLACE-ME",
     "ANTHROPIC_API_KEY": "",
-    "ANTHROPIC_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "ANTHROPIC_DEFAULT_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "ANTHROPIC_SMALL_FAST_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL": "z-ai/glm-5.3-flash",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "deepseek/deepseek-v4-flash-0731",
-    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1310720",
+    "ANTHROPIC_MODEL": "xiaomi/mimo-v2.6-pro",
+    "ANTHROPIC_DEFAULT_MODEL": "xiaomi/mimo-v2.6-pro",
+    "ANTHROPIC_SMALL_FAST_MODEL": "xiaomi/mimo-v2.6-pro",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "xiaomi/mimo-v2.6-pro",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "xiaomi/mimo-v2.6-pro",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "openai/gpt-6-luna",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "xiaomi/mimo-v2.6-pro",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
     "MAX_THINKING_TOKENS": "0",
     "API_TIMEOUT_MS": "600000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
@@ -249,7 +245,7 @@ curl https://openrouter.ai/api/v1/messages \
   -H "Authorization: Bearer sk-or-v1-..." \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
-  -d '{"model":"deepseek/deepseek-v4-flash-0731","max_tokens":64,
+  -d '{"model":"xiaomi/mimo-v2.6-pro","max_tokens":64,
        "messages":[{"role":"user","content":"say routed"}]}'
 ```
 
@@ -328,7 +324,7 @@ The statusline ends with the installed version — the commit of this repo that 
 on your machine:
 
 ```
-● deepseek-v4-flash-0731 (cheap) | my-project | main | $0.0031 | v20d0269
+● mimo-v2.6-pro (default) | my-project | main | $0.0031 | v20d0269
 ```
 
 When the session-start check finds a newer commit, it turns yellow immediately, whether or
@@ -540,7 +536,7 @@ hook from `settings.json`.
 ## Statusline
 
 ```
-* glm-5.3-flash (dear) | ctx 12% | cache 91% | high | my-project | main | $0.0312 | v59f677b
+* gpt-6-luna (opus) | ctx 12% | cache 91% | high | my-project | main | $0.0312 | v59f677b
 ```
 
 Every field comes from one Claude Code documents for status lines, not from

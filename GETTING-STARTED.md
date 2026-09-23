@@ -12,14 +12,14 @@ single command — most of this guide is getting your machine ready to run it.
 
 Claude Code is a coding assistant that runs in your terminal and in VSCode. Normally it
 talks to Anthropic's servers and bills your Anthropic account. After this guide it will
-talk to **OpenRouter** instead, which lets you use models like DeepSeek and GLM and pay
+talk to **OpenRouter** instead, which lets you use models like MiMo and GPT-6 Luna and pay
 per use.
 
 Three pieces are involved:
 
 ```
   Claude Code  ──►  OpenRouter  ──►  the actual model
-  (what you type)   (a website that   (DeepSeek, GLM, …)
+  (what you type)   (a website that   (MiMo, Luna, …)
                      resells models)
 ```
 
@@ -189,7 +189,7 @@ The first time, Claude Code may ask you to pick a theme and accept its terms. Sa
 Type a question and press `Enter`. At the bottom of the screen you will see a line like:
 
 ```
-● deepseek-v4-flash-0731 (cheap) | high | ccr-openrouter | main | $0.0002
+● mimo-v2.6-pro (default) | high | ccr-openrouter | main | $0.0002
 ```
 
 That is the statusline, and it is telling you the truth about which model answered.
@@ -230,14 +230,14 @@ npx --allow-git=root github:djerok/claude-openrouter --uninstall   # undo everyt
 
 After `--off` or `--on`, open a new terminal / reload VSCode for it to take effect.
 
-Two models are set up. The cheap one answers everything. When you want the stronger one,
+Two models are set up. MiMo answers everything. When you want the other one, GPT-6 Luna,
 type this inside Claude Code:
 
 ```
 /model opus
 ```
 
-That switches to GLM. `/model sonnet` puts you back on the cheap one.
+That switches to Luna. `/model sonnet` puts you back on MiMo.
 
 ---
 

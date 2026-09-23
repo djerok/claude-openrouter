@@ -34,8 +34,8 @@
     "openrouter",
     "claude-code-router",
     "ccr",
-    "deepseek",
-    "glm",
+    "mimo",
+    "gpt-6",
     "llm",
     "statusline"
   ],
