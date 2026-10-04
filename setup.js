@@ -190,13 +190,21 @@ function nodeCommand(script) {
   return `${fwd(exe)} "${fwd(script)}"`;
 }
 
-/** Windows' 8.3 name for a path, or null. cmd's %~s is the one built-in way to ask. */
+/**
+ * Windows' 8.3 name for a path, or null. cmd's %~s is the one built-in way to ask.
+ *
+ * The command line goes to cmd verbatim, wrapped for /s. Passed as an ordinary
+ * argument, Node escapes its quotes as \" -- the convention C programs use and
+ * cmd does not -- and cmd answered with garbage like C:\"C:\Program Files\",
+ * which was then rejected, so every lookup quietly came back null.
+ */
 function shortPath(p) {
   if (!IS_WIN) return null;
   try {
-    const r = spawnSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], {
+    const r = spawnSync('cmd.exe', ['/d', '/s', '/c', `"for %I in ("${p}") do @echo %~sI"`], {
       encoding: 'utf8',
       windowsHide: true,
+      windowsVerbatimArguments: true,
     });
     const out = (r.stdout || '').trim().split(/\r?\n/).pop() || '';
     return out && !/\s/.test(out) && fs.existsSync(out) ? out : null;
@@ -1301,10 +1309,11 @@ function log(msg) {
   try { fs.appendFileSync(LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch {}
 }
 
-// Ask GitHub for the newest commit on main. With the ETag from last time, an
-// unchanged answer comes back as 304 Not Modified, which GitHub does not count
-// against the hourly allowance -- a room of laptops behind one school address
-// would otherwise share 60 checks an hour.
+// Ask GitHub for the newest commit on main, sending the ETag from last time so
+// an unchanged answer is a bodiless 304. That saves bandwidth only: without an
+// Authorization header a 304 still counts against the 60-an-hour allowance per
+// address, so the thirty-minute spacing is what keeps a room of laptops behind
+// one school address under it (two checks an hour each).
 async function newestSha(state, timeoutMs) {
   const headers = { accept: 'application/vnd.github+json', 'user-agent': 'claude-openrouter-autoupdate' };
   if (state.etag && state.latestSeen) headers['if-none-match'] = state.etag;
@@ -1364,15 +1373,49 @@ async function check() {
   // This session already started on the old setup. Say so on screen -- a
   // systemMessage is shown to the person, unlike plain output -- so whoever is
   // at the keyboard knows to restart rather than wondering why nothing changed.
-  process.stdout.write(JSON.stringify({
-    systemMessage: 'There is a newer version of this setup (' + sha.slice(0, 7) + '). It is ' +
-      'installing now. In a minute, close Claude Code and open it again to use it.',
-  }));
+  // If this very update already failed here, say that instead.
+  const short = sha.slice(0, 7);
+  const systemMessage = state.failedSha === sha
+    ? 'An update to this setup (' + short + ') did not install last time. Trying again now. ' +
+      'If this message keeps coming back, run the install line again.'
+    : 'There is a newer version of this setup (' + short + '). It is installing now. ' +
+      'In a minute, close Claude Code and open it again to use it.';
+  process.stdout.write(JSON.stringify({ systemMessage }));
 }
 
 // --- child: download and reinstall one known commit ----------------------
+//
+// One reinstall at a time. Two sessions started together -- a terminal and the
+// VS Code extension -- would otherwise run two installers writing the same
+// settings.json. A lock older than ten minutes is from an installer that died.
 async function install(sha) {
   if (!/^[0-9a-f]{40}$/.test(String(sha))) return log('install: not a commit id: ' + sha);
+  const lock = path.join(DIR, 'openrouter-update.lock');
+  try {
+    if (Date.now() - fs.statSync(lock).mtimeMs > 10 * 60 * 1000) fs.unlinkSync(lock);
+  } catch {}
+  let fd;
+  try {
+    fd = fs.openSync(lock, 'wx');
+  } catch {
+    return log('another update is already running');
+  }
+  let ok = false;
+  try {
+    ok = await reinstall(sha);
+  } finally {
+    try { fs.closeSync(fd); fs.unlinkSync(lock); } catch {}
+  }
+  // Remembered so the next session says "did not install" rather than claiming,
+  // every thirty minutes, that it is installing now.
+  const s = readState();
+  if (ok) delete s.failedSha;
+  else s.failedSha = sha;
+  writeState(s);
+}
+
+// True only when the new setup.js ran to the end without an error.
+async function reinstall(sha) {
   const state = readState();
 
   // Pinned to the commit, not to /main/. The branch URL is served from a CDN
@@ -1400,7 +1443,7 @@ async function install(sha) {
     return log('could not write temp file: ' + err.message);
   }
 
-  await new Promise((resolve) => {
+  const ok = await new Promise((resolve) => {
     // Replay the options this machine was installed with. Without them the
     // update quietly reinstalls the defaults, undoing --reliable, --extras and
     // --usagelog on a machine whose owner explicitly asked for them.
@@ -1422,12 +1465,13 @@ async function install(sha) {
         s.outdated = false;
         writeState(s);
       }
-      resolve();
+      resolve(c === 0);
     });
-    child.on('error', (err) => { log('reinstall failed: ' + err.message); resolve(); });
+    child.on('error', (err) => { log('reinstall failed: ' + err.message); resolve(false); });
   });
 
   try { fs.unlinkSync(tmp); } catch {}
+  return ok;
 }
 
 // --- parent: must return instantly ----------------------------------------

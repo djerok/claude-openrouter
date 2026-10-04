@@ -315,8 +315,10 @@ Claude Code it checks — at most once every thirty minutes, and for at most 1.5
 whether this repo has a newer commit. If there is one it reinstalls in the background and
 **says so on screen**: Claude Code reads its settings before any hook runs, so the update
 only takes effect once you close Claude Code and open it again, and the message tells you
-to. Repeat checks send GitHub's ETag, so an unchanged answer is free of the API's hourly
-allowance — a room of laptops behind one school address would otherwise share 60 an hour.
+to. GitHub allows 60 unauthenticated checks an hour per address, shared by a whole room of
+laptops behind one school address; at two checks an hour each, that is room for about
+thirty. (Repeat checks send an ETag, which saves bandwidth but — without authentication —
+not that allowance.)
 Every path swallows its own errors: no network costs at most the 1.5 seconds, never the
 session. A log is at `~/.claude/openrouter-autoupdate.log`. Pass `--no-autoupdate` to skip it.
 
