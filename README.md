@@ -310,13 +310,25 @@ from a blank machine to a working session, with no "now open a new terminal" hom
 also prints the resolved path of the `claude` executable and of your settings file, so you
 always know exactly what was configured and where. Pass `--no-launch` to stay at the shell.
 
-It also installs a **SessionStart hook that keeps itself up to date**. Every time you start
-Claude Code it checks — at most once every six hours — whether this repo has a newer commit,
-and if so reapplies the setup in the background. The hook itself does almost nothing: it
-rate-limits, detaches a child process and returns immediately, so it can never slow down or
-break the session you are starting. Every path swallows its own errors by design. The
-result lands on your next session, and a log of what happened is at
-`~/.claude/openrouter-autoupdate.log`. Pass `--no-autoupdate` to skip it.
+It also installs a **SessionStart hook that keeps itself up to date**. When you start
+Claude Code it checks — at most once every thirty minutes, and for at most 1.5 seconds —
+whether this repo has a newer commit. If there is one it reinstalls in the background and
+**says so on screen**: Claude Code reads its settings before any hook runs, so the update
+only takes effect once you close Claude Code and open it again, and the message tells you
+to. Repeat checks send GitHub's ETag, so an unchanged answer is free of the API's hourly
+allowance — a room of laptops behind one school address would otherwise share 60 an hour.
+Every path swallows its own errors: no network costs at most the 1.5 seconds, never the
+session. A log is at `~/.claude/openrouter-autoupdate.log`. Pass `--no-autoupdate` to skip it.
+
+### Windows, with or without Git Bash
+
+Claude Code runs hooks and the statusline through Git Bash when it is installed and through
+PowerShell when it is not. Every command this installer writes has the form
+`C:/path/to/node.exe "C:/path/to/hook.js"` — an unquoted executable and forward slashes —
+which both shells accept. (Before this, the executable was quoted, which PowerShell reads as
+a string rather than a command: on a laptop without Git Bash every hook and the statusline
+failed with `Unexpected token`, including the auto-updater that would have fixed them.
+Re-running the install line once repairs such a laptop; it reuses the key already there.)
 
 ## Version, on every launch
 
@@ -372,23 +384,32 @@ share of them the provider's cache absorbed.
 
 ## Usage logging
 
-Every assistant turn appends one line to `~/.claude/openrouter-usage.jsonl`. This is a
-plain Stop hook — a small Node function reading the hook payload and writing a file. **No
-model is involved and it costs nothing**; it is accounting, not analysis.
+**Off by default — install with `--usagelog` to turn it on.** It is only accounting, and it
+has caused two user-visible faults in the past; nothing that merely reports on the work
+should be able to disturb it, so it has to be asked for. Installing without the flag removes
+it again.
+
+With it on, every assistant turn appends one line to `~/.claude/openrouter-usage.jsonl`.
+This is a plain Stop hook — a small Node function writing a file. **No model is involved
+and it costs nothing**; it is accounting, not analysis.
 
 ```sh
 node setup.js --usage
 ```
 
 shows live spend straight from OpenRouter (total, today, this week, this month, credit
-remaining — the authoritative numbers) and the local totals per turn and per model.
+remaining — the authoritative numbers) — that part works with or without the log — and,
+from the log, the totals per turn and per model.
 
-The hook does not hard-code field names. It walks the payload and keeps anything that looks
-like a token count, a cost or a duration, so it keeps working if the payload shape changes
-and an unfamiliar field shows up in the log rather than being silently dropped.
+The counts come from the session transcript, not the hook payload: the Stop payload carries
+no usage at all. (An earlier version looked for numbers in the payload, found none, and so
+wrote nothing on any turn while appearing to work.) Each line counts every API response
+since the last thing you typed — each response once, though the transcript repeats it per
+content block — with the model, the number of API calls and how long the turn took. The
+cache share in `--usage` is cache reads over the whole prompt (fresh input + cache writes +
+cache reads), the way Anthropic-style usage counts them.
 
-`--no-usagelog` skips it. `--uninstall` removes the hook but **keeps the log** — it is your
-data.
+`--uninstall` removes the hook but **keeps the log** — it is your data.
 
 ## Modes
 
@@ -404,7 +425,7 @@ npx --allow-git=root github:djerok/claude-openrouter --no-extras         # skip 
 npx --allow-git=root github:djerok/claude-openrouter --no-launch         # do not start Claude Code at the end
 npx --allow-git=root github:djerok/claude-openrouter --no-autoupdate     # do not self-update on session start
 npx --allow-git=root github:djerok/claude-openrouter --usage             # token and spend totals
-npx --allow-git=root github:djerok/claude-openrouter --no-usagelog       # do not log per-turn usage
+npx --allow-git=root github:djerok/claude-openrouter --usagelog          # log per-turn usage (off by default)
 npx --allow-git=root github:djerok/claude-openrouter --version           # installed version vs GitHub
 npx --allow-git=root github:djerok/claude-openrouter --trim              # see/disable MCP servers
 ```
