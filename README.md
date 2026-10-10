@@ -101,6 +101,12 @@ A normal stop, zero characters of output, after a tool call that succeeded.
 It does not reproduce against the API at all, so whatever triggers it needs the larger and
 more complex exchange Claude Code really sends. Re-asking worked.
 
+Current Claude Code does that re-asking itself: when a turn ends with no text, it adds a
+nudge and asks once more (it is in the 2.1.280 code as `thinking_only_retry`). Installs of
+this setup could not receive that, because the setup had switched Claude Code's updates off
+— fixed now, see below. The other failure in the same family, a reply that is tool-call
+markup instead of an answer, Claude Code does not catch; the [reply guard](#replies-that-are-markup-instead-of-an-answer) does.
+
 **This number has been wrong twice in this file, in both directions.** It was first
 published as 4 in 10, measured while a hook shipped by this project was failing on every
 turn because the generated file was not valid JavaScript. It was then published as 2% at
@@ -164,9 +170,10 @@ and Gemini models, which this never routes to.
    install time instead of on your first prompt.
 3. Puts `WANTED.a` in the default slot and `WANTED.b` in the opus slot.
 4. Writes `~/.claude/settings.json` (backing up whatever was there).
-5. Writes a statusline that names the model actually in use.
-6. Writes a plain-language `~/.claude/CLAUDE.md` — see below.
-7. Sends one real request and shows you the reply. A config that writes but does not work
+5. Writes a statusline that names the model actually in use and shows both versions.
+6. Adds a seven-line English-replies note to `~/.claude/CLAUDE.md` — see below.
+7. Installs two hooks: a session-start updater for this setup, and a reply guard (below).
+8. Sends one real request and shows you the reply. A config that writes but does not work
    is a failed install, and you should learn that now.
 
 ## Manual setup, without the script
@@ -217,7 +224,12 @@ which is why one file covers the CLI and the VSCode extension at once:
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1048576",
     "MAX_THINKING_TOKENS": "0",
     "API_TIMEOUT_MS": "600000",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
+    "DISABLE_BUG_COMMAND": "1",
+    "CLAUDE_ENABLE_STREAM_WATCHDOG": "1",
+    "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS": "120000"
   }
 }
 ```
@@ -237,6 +249,19 @@ Then open a **new** terminal, or reload the VSCode window.
 - **`MAX_THINKING_TOKENS: "0"`.** OpenRouter returns thinking blocks with an empty
   signature, and it removes a large cost: in a measured request 57 of 63 output tokens were
   thinking.
+- **No `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`.** Earlier versions set it, for privacy.
+  It also switches off **Claude Code's own auto-updates** — the docs say so, its code does
+  it, and `claude doctor` reports `Auto-updates: disabled (set by env:
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC)` — so every install stayed on the Claude Code
+  version it started with, missing the fixes for stalled streams and empty replies. The
+  four `DISABLE_*` variables keep the privacy half of it. Even `"0"` disables updates for
+  that variable, so it has to be absent; the installer deletes it.
+- **`CLAUDE_ENABLE_STREAM_WATCHDOG` and `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`.** Through a
+  gateway like OpenRouter, Claude Code waits five minutes on a connection that has gone
+  completely silent before it gives up and retries, which reads as a frozen program. This
+  makes it two. A live response never pauses anywhere near that long: the longest gap
+  between bytes measured was 0.6 s on MiMo and 7.8 s on Luna. Before Claude Code 2.1.196
+  the watchdog was off for every provider except Anthropic, hence the explicit `1`.
 
 **Check it by hand**
 
@@ -281,10 +306,11 @@ Always write your replies in English, whatever language you reason in.
 <!-- END claude-openrouter: language -->
 ```
 
-It is there because both models come from Chinese labs and occasionally answer an English
-question in Chinese. No request parameter controls that, so an instruction is the only lever.
-It is written only when the configured model is from a family that drifts, `--no-language-hint`
-skips it, and `--uninstall` removes it.
+It is there because DeepSeek and GLM, the earlier defaults, occasionally answered an English
+question in Chinese, and MiMo comes from a Chinese lab too (whether it drifts the same way has
+not been measured). No request parameter controls that, so an instruction is the only lever.
+It is written only when the configured model is from one of those families (MiMo was left out
+of the list by mistake until now), `--no-language-hint` skips it, and `--uninstall` removes it.
 
 **No style or tone rules are written.** An earlier version added a long "write like you are
 explaining to a smart 10-year-old" section; it is gone, and installing now *removes* it from
@@ -315,12 +341,53 @@ Claude Code it checks — at most once every thirty minutes, and for at most 1.5
 whether this repo has a newer commit. If there is one it reinstalls in the background and
 **says so on screen**: Claude Code reads its settings before any hook runs, so the update
 only takes effect once you close Claude Code and open it again, and the message tells you
-to. GitHub allows 60 unauthenticated checks an hour per address, shared by a whole room of
-laptops behind one school address; at two checks an hour each, that is room for about
-thirty. (Repeat checks send an ETag, which saves bandwidth but — without authentication —
-not that allowance.)
+to.
+
+The check asks git's own ref listing (`github.com/<repo>.git/info/refs`, the request every
+`git clone` makes) rather than GitHub's REST API, which allows only 60 unauthenticated
+requests an hour per address — shared by every machine behind a school or campus address,
+and often used up before this setup asks. The API is the fallback. A check that cannot
+finish in its 1.5 seconds no longer gives up for thirty minutes: it hands over to a
+background retry that nobody waits on. While routing is switched off with `--off`, the
+updater does nothing, so it cannot switch a machine back to OpenRouter behind your back.
+
 Every path swallows its own errors: no network costs at most the 1.5 seconds, never the
 session. A log is at `~/.claude/openrouter-autoupdate.log`. Pass `--no-autoupdate` to skip it.
+
+**Claude Code updates itself too.** Earlier versions of this setup switched that off without
+meaning to (see `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` above). An install now removes
+that variable, along with `DISABLE_AUTOUPDATER` and `DISABLE_UPDATES` — unless you pass
+`--no-autoupdate`, which leaves your own Claude Code update setting exactly as it is.
+`--status` and `--doctor` both say whether Claude Code is updating, and if not, why.
+
+The installer records a commit only when the file it is running **is** that commit, byte
+for byte. The bootstrappers fetch `setup.js` from the raw `/main/` URL, which a CDN keeps
+serving for minutes after a push; an install in that window used to run the previous file
+while recording the new commit, so the updater thought it was current and never replaced
+it. Such a copy is now recorded as unknown and replaced at the very next session start.
+
+### Replies that are markup instead of an answer
+
+Models served through OpenRouter sometimes write a tool call out as **text**, in their own
+native syntax, instead of making it. Nothing runs, the turn ends, and you see something like
+this where the answer should be — the session looks dead:
+
+```
+??</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>
+```
+
+That one is DeepSeek's DSML. Claude Code re-asks by itself when a reply is *empty*, but this
+reply is not empty, so it stands. The installer adds a small **Stop hook** for it: when the
+last reply contains tool-call markup — DeepSeek, Kimi, OpenAI-harmony, Hermes/Qwen, GLM,
+Mistral or Llama syntax, outside code blocks — it blocks the stop **once**, with a note the
+model reads, and the model tries again. It never blocks twice in a row, and it changes
+nothing otherwise. Each retry is logged to `~/.claude/openrouter-guard.log`. Pass
+`--no-guard` to leave it out.
+
+Tested against real Claude Code 2.1.280 with a mock API that answers with the markup above:
+one retry, the recovered answer is what you see, no loop.
 
 ### Windows, with or without Git Bash
 
@@ -332,21 +399,28 @@ a string rather than a command: on a laptop without Git Bash every hook and the 
 failed with `Unexpected token`, including the auto-updater that would have fixed them.
 Re-running the install line once repairs such a laptop; it reuses the key already there.)
 
-## Version, on every launch
+## Version, always on screen
 
-The statusline ends with the installed version — the commit of this repo that is actually
-on your machine:
-
-```
-● mimo-v2.6-pro (default) | my-project | main | $0.0031 | v20d0269
-```
-
-When the session-start check finds a newer commit, it turns yellow immediately, whether or
-not the update itself succeeds:
+Right after the model, the statusline shows this setup's version — the commit actually on
+your machine — and Claude Code's own version. It sits near the front because the end of a
+long statusline is what a narrow terminal cuts off:
 
 ```
-... | v20d0269 (update pending)
+* mimo-v2.6-pro (default) | v20d0269 cc 2.1.280 | ctx 12% | my-project | main | $0.0031
 ```
+
+It changes as things happen:
+
+| shows | means |
+|---|---|
+| `v20d0269 updating` (yellow) | a newer commit was found and is installing |
+| `v20d0269 (restart for v9a1b2c3)` (yellow) | it installed; this session still runs the old one |
+| `v20d0269 update failed` (red) | the automatic update could not install; run the install line again |
+| `v?` | this copy could not be matched to a commit; it is replaced at the next session start |
+
+The "restart" case works because the version is also written into `settings.json`'s `env`
+block, which a session reads once when it starts; the statusline compares that with what
+is on disk now. Where no statusline is drawn, `--status` prints both versions.
 
 To compare directly against GitHub:
 
@@ -423,9 +497,9 @@ npx --allow-git=root github:djerok/claude-openrouter --off               # back 
 npx --allow-git=root github:djerok/claude-openrouter --on                # back to OpenRouter
 npx --allow-git=root github:djerok/claude-openrouter --uninstall         # restore the newest backup
 npx --allow-git=root github:djerok/claude-openrouter --no-verify         # skip the live test
-npx --allow-git=root github:djerok/claude-openrouter --no-extras         # skip CLAUDE.md, caveman, rtk
 npx --allow-git=root github:djerok/claude-openrouter --no-launch         # do not start Claude Code at the end
 npx --allow-git=root github:djerok/claude-openrouter --no-autoupdate     # do not self-update on session start
+npx --allow-git=root github:djerok/claude-openrouter --no-guard          # no retry for replies that are markup
 npx --allow-git=root github:djerok/claude-openrouter --usage             # token and spend totals
 npx --allow-git=root github:djerok/claude-openrouter --usagelog          # log per-turn usage (off by default)
 npx --allow-git=root github:djerok/claude-openrouter --version           # installed version vs GitHub
@@ -476,7 +550,7 @@ What that does, precisely:
 | | |
 |---|---|
 | **Restores** | `~/.claude/settings.json` from the newest backup that is **not** routed. If every backup is routed, it strips the routing keys from the current file instead and puts back the parked `model`. |
-| **Removes** | `~/.claude/statusline-openrouter.js`, `~/.claude/hooks/openrouter-usage.js`, `~/.claude/hooks/openrouter-autoupdate.js`, and the marked block in `~/.claude/CLAUDE.md` |
+| **Removes** | `~/.claude/statusline-openrouter.js`, `~/.claude/hooks/openrouter-usage.js`, `~/.claude/hooks/openrouter-autoupdate.js`, `~/.claude/hooks/openrouter-guard.js`, their entries in `settings.json`, and the marked block in `~/.claude/CLAUDE.md` |
 | **Keeps** | `~/.claude/openrouter-usage.jsonl` — your own data — and every `*.bak.*` file |
 | **Never touches** | Claude Code itself, your Anthropic login, your projects, or any hook you configured yourself |
 
@@ -509,12 +583,16 @@ ANTHROPIC_API_KEY               ANTHROPIC_DEFAULT_OPUS_MODEL
 ANTHROPIC_MODEL                 CLAUDE_CODE_SUBAGENT_MODEL
 ANTHROPIC_DEFAULT_MODEL         CLAUDE_CODE_MAX_CONTEXT_TOKENS
 ANTHROPIC_SMALL_FAST_MODEL      MAX_THINKING_TOKENS
-API_TIMEOUT_MS                  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+API_TIMEOUT_MS                  CLAUDE_OPENROUTER_VERSION
+DISABLE_TELEMETRY               DISABLE_ERROR_REPORTING
+DISABLE_FEEDBACK_COMMAND        DISABLE_BUG_COMMAND
+CLAUDE_ENABLE_STREAM_WATCHDOG   CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC   (older installs)
 ```
 
 If there is a `__parkedModel` key, move its value back to `model` and delete it. Remove the
-`statusLine` entry, and any `hooks` entry whose command mentions `openrouter-usage` or
-`openrouter-autoupdate`.
+`statusLine` entry, and any `hooks` entry whose command mentions `openrouter-usage`,
+`openrouter-autoupdate` or `openrouter-guard`.
 
 Or simply overwrite the file with a backup — they are named
 `settings.json.bak.<timestamp>`, and the oldest one is your original.
@@ -525,8 +603,10 @@ Or simply overwrite the file with a backup — they are named
 ~/.claude/statusline-openrouter.js
 ~/.claude/hooks/openrouter-usage.js
 ~/.claude/hooks/openrouter-autoupdate.js
+~/.claude/hooks/openrouter-guard.js
 ~/.claude/openrouter-setup-state.json
 ~/.claude/openrouter-autoupdate.log
+~/.claude/openrouter-guard.log
 ~/.claude/openrouter-usage.jsonl          (your usage data — keep it if you want it)
 ```
 
@@ -552,14 +632,14 @@ daemon to stop and no startup entry to remove.
 node setup.js --key sk-or-v1-... --no-autoupdate
 ```
 
-That reinstalls without the session-start check. To disable it on a setup you already have,
-delete `~/.claude/hooks/openrouter-autoupdate.js` and remove the matching `SessionStart`
-hook from `settings.json`.
+That reinstalls without the session-start check, and removes the one already there. (It
+used to leave an existing updater in place, so the flag did nothing on exactly the machines
+it was meant for.) Claude Code's own update setting is left as you have it.
 
 ## Statusline
 
 ```
-* gpt-6-luna (opus) | ctx 12% | cache 91% | high | my-project | main | $0.0312 | v59f677b
+* gpt-6-luna (opus) | v59f677b cc 2.1.280 | ctx 12% | cache 91% | high | my-project | main | $0.0312
 ```
 
 Every field comes from one Claude Code documents for status lines, not from
@@ -568,11 +648,12 @@ anything invented here:
 | field | source | why it matters |
 |---|---|---|
 | model + tier | your settings | which of the two models answered |
+| `vNNNNNNN` | this project's installed commit | see [Version, always on screen](#version-always-on-screen) |
+| `cc N.N.N` | `version` | Claude Code's own version, which now updates itself |
 | `ctx NN%` | `context_window.used_percentage` | what drives compaction; red past 90% |
 | `cache NN%` | `prompt_cache.hit_ratio` | whether resending the conversation each turn is cheap. Red under 40%, and `cold` when the cached prefix has expired |
 | effort | `effort.level` | live value, including mid-session `/effort` changes |
 | cost | `cost.total_cost_usd` | session spend |
-| `vNNNNNNN` | this project's installed commit | turns yellow with `up!` when a newer version is waiting |
 
 Cache hit rate is the number to watch. Claude Code resends the whole
 conversation every turn; whether that is billed at full price or at the cached
@@ -616,6 +697,12 @@ trimming anything.
 | Model retired or renamed | Caught against the live catalogue at install time |
 | No credit on the account | The 401 is reported plainly, not left to surface later |
 | Old install still pointing at `127.0.0.1` | Detected and replaced, and `--status` warns about it |
+| School or campus network, GitHub API allowance used up | The updater asks git's ref listing instead, which that allowance does not count |
+| Slow network at session start | The 1.5-second check hands over to a background retry instead of giving up for thirty minutes |
+| `brew upgrade node` on a Mac | Hooks and statusline run Homebrew's `opt/` link, not the versioned folder the upgrade deletes |
+| Windows user name with a space in it | The launch at the end quotes the path (it used to stop at the space) |
+| A failure during `irm ... \| iex` | The error stays on screen; `exit` used to close the window before it could be read |
+| A damaged `openrouter-setup-state.json` | Treated as empty instead of stopping every later install, including the updater's |
 
 Installer exit codes are trusted nowhere — `winget` reports success while installing
 nothing, so every step is verified by running the program and reading its output.

@@ -32,7 +32,9 @@
  *                                      # (off by default: they change how the model is
  *                                      #  instructed, and a small model can go silent)
  *   node setup.js --no-launch          # do not start Claude Code when finished
- *   node setup.js --no-autoupdate      # do not check GitHub for updates at session start
+ *   node setup.js --no-autoupdate      # do not check GitHub for updates at session start, and
+ *                                      # leave Claude Code's own update setting as it is
+ *   node setup.js --no-guard           # do not retry a reply that printed a tool call as text
  *   node setup.js --version            # installed version vs GitHub
  *   node setup.js --trim               # see/disable MCP servers (they cost tokens every request)
  *   node setup.js --untrim             # put the MCP servers back
@@ -88,6 +90,10 @@ const RAW_BASE = `https://raw.githubusercontent.com/${REPO}/main`;
 const STATE_FILE = path.join(CLAUDE_DIR, 'openrouter-setup-state.json');
 // Older installs wrote this name; still read it so --on keeps working.
 const LEGACY_STATE_FILE = path.join(CLAUDE_DIR, 'ccr-openrouter-state.json');
+const GUARD_HOOK = path.join(CLAUDE_DIR, 'hooks', 'openrouter-guard.js');
+
+// Choices an unattended update must replay, or it quietly resets them to defaults.
+const SAVED_OPTIONS = ['--reliable', '--extras', '--efficient', '--usagelog', '--no-guard', '--no-language-hint'];
 
 const IS_WIN = process.platform === 'win32';
 
@@ -139,6 +145,37 @@ function writeJson(file, obj) {
 }
 
 /**
+ * This script's own state file, which must never stop an install.
+ *
+ * readJson() dies on invalid JSON, which is right for settings.json. The state
+ * file is different: the updater rewrites it unattended, and one torn write left
+ * a file every later reinstall refused to read -- so the updater could no longer
+ * repair anything, including itself. Unreadable state is treated as no state.
+ */
+function readState() {
+  for (const f of [STATE_FILE, LEGACY_STATE_FILE]) {
+    try {
+      const st = JSON.parse(fs.readFileSync(f, 'utf8').replace(/^﻿/, ''));
+      if (st && typeof st === 'object') return st;
+    } catch {}
+  }
+  return {};
+}
+
+/** Write the state file whole or not at all, so a reader never sees half of it. */
+function writeState(obj) {
+  fs.mkdirSync(CLAUDE_DIR, { recursive: true });
+  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2) + '\n', { mode: 0o600 });
+    fs.renameSync(tmp, STATE_FILE);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch {}
+    writeJson(STATE_FILE, obj);
+  }
+}
+
+/**
  * Write a file this script generates, refusing to write it if it is not valid
  * JavaScript.
  *
@@ -185,9 +222,30 @@ function writeGenerated(file, source, label) {
  */
 function nodeCommand(script) {
   const fwd = (p) => p.split(path.sep).join('/');
-  let exe = process.execPath;
+  let exe = stableNode(process.execPath);
   if (/\s/.test(exe)) exe = shortPath(exe) || 'node';
   return `${fwd(exe)} "${fwd(script)}"`;
+}
+
+/**
+ * A path to this Node that survives the Node install being upgraded.
+ *
+ * On macOS process.execPath is the resolved real file, and under Homebrew that
+ * is a versioned folder -- /opt/homebrew/Cellar/node/24.9.0/bin/node -- which
+ * `brew upgrade` deletes. Every hook and the statusline then failed with "No such
+ * file", including the auto-updater that would have repaired them. Homebrew's
+ * opt/ link always points at whichever version is installed now.
+ */
+function stableNode(exe, isWin = IS_WIN) {
+  if (isWin) return exe;
+  const m = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/node$/.exec(exe);
+  if (!m) return exe;
+  for (const candidate of [`${m[1]}/opt/${m[2]}/bin/node`, `${m[1]}/bin/node`]) {
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {}
+  }
+  return exe;
 }
 
 /**
@@ -226,11 +284,60 @@ function setHook(settings, event, marker, hook) {
   settings.hooks[event] = [...others, { hooks: [hook] }];
 }
 
+/** Unregister one of this script's hooks and delete its file. True if anything changed. */
+function removeHook(settings, event, marker, file) {
+  let touched = false;
+  if (settings.hooks && settings.hooks[event]) {
+    const before = settings.hooks[event].length;
+    settings.hooks[event] = settings.hooks[event].filter((e) => !JSON.stringify(e).includes(marker));
+    if (settings.hooks[event].length !== before) touched = true;
+    if (!settings.hooks[event].length) delete settings.hooks[event];
+  }
+  try {
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+      touched = true;
+    }
+  } catch {}
+  return touched;
+}
+
 function backup(file) {
   if (!fs.existsSync(file)) return null;
   const dest = `${file}.bak.${new Date().toISOString().replace(/[:.]/g, '-')}`;
   fs.copyFileSync(file, dest);
   return dest;
+}
+
+/** The ANTHROPIC_BASE_URL a settings backup routes to, or '' -- never fatal. */
+function backupBaseUrl(name) {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, name), 'utf8').replace(/^﻿/, ''));
+    return String(((cfg && cfg.env) || {}).ANTHROPIC_BASE_URL || '');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Keep the newest few routed backups of settings.json and delete older ones.
+ *
+ * Every install writes a backup, and so does every unattended update, so a
+ * laptop that has taken twenty updates holds twenty copies of its own routed
+ * settings. Backups that are NOT routed are never deleted: --uninstall restores
+ * the newest of those, and the oldest is the person's original file.
+ */
+function pruneRoutedBackups(keep = 10) {
+  let names;
+  try {
+    names = fs.readdirSync(CLAUDE_DIR).filter((f) => f.startsWith('settings.json.bak.')).sort();
+  } catch {
+    return;
+  }
+  const routed = names.filter((f) => /openrouter/.test(backupBaseUrl(f)));
+  for (const f of routed.slice(0, Math.max(0, routed.length - keep))) {
+    try { fs.unlinkSync(path.join(CLAUDE_DIR, f)); } catch {}
+  }
 }
 
 function run(cmd, args, opts = {}) {
@@ -276,7 +383,12 @@ function probeClaude() {
     // Resolve the real file so the path printed at the end is something the
     // user can actually click, copy or hand to a bug report.
     const which = IS_WIN ? run('where', ['claude']) : run('which', ['claude']);
-    const resolved = which.code === 0 && which.stdout ? which.stdout.split('\n')[0].trim() : 'claude';
+    const found = which.code === 0 ? which.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean) : [];
+    // npm puts three files in its bin folder -- claude, claude.cmd, claude.ps1 --
+    // and `where` lists the extensionless one first. That one is a shell script
+    // Windows cannot run, so starting it at the end of the install failed with
+    // "'C:Users...' is not recognized". Take the first one Windows can start.
+    const resolved = (IS_WIN ? found.find((l) => /\.(exe|cmd|bat)$/i.test(l)) : found[0]) || 'claude';
     return { version: res.stdout.split('\n')[0], path: resolved };
   }
   const prefix = run('npm', ['prefix', '-g']).stdout;
@@ -484,8 +596,11 @@ function pickModel(catalogue, want) {
  * working across upgrades instead of silently falling back to a Claude model
  * the key cannot buy.
  */
-function routingEnv(key, main, opus, contextTokens) {
+function routingEnv(key, main, opus, contextTokens, sha) {
   return {
+    // Not read by Claude Code. The statusline compares it, as this session
+    // loaded it, with what is on disk now, to say when a restart is needed.
+    CLAUDE_OPENROUTER_VERSION: sha ? String(sha).slice(0, 7) : '',
     ANTHROPIC_BASE_URL: API_ROOT,
     ANTHROPIC_AUTH_TOKEN: key,
     ANTHROPIC_API_KEY: '',
@@ -497,7 +612,23 @@ function routingEnv(key, main, opus, contextTokens) {
     ANTHROPIC_DEFAULT_OPUS_MODEL: opus,
     CLAUDE_CODE_SUBAGENT_MODEL: main,
     API_TIMEOUT_MS: '600000',
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    // The privacy half of what CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC used to
+    // do here, without the half that broke things. That one variable also turns
+    // off Claude Code's own auto-updates -- its docs say so, and so does its
+    // code -- so every machine stayed on the Claude Code it was installed with,
+    // and never received the fixes for stalled streams and empty replies.
+    DISABLE_TELEMETRY: '1',
+    DISABLE_ERROR_REPORTING: '1',
+    DISABLE_FEEDBACK_COMMAND: '1',
+    DISABLE_BUG_COMMAND: '1',
+    // Abort and retry a stream that has gone completely silent. Unset, a dead
+    // connection to a gateway like OpenRouter shows a spinner for five minutes
+    // before anything happens, which reads as a frozen program. A live response
+    // never pauses that long: the longest gap measured between bytes was 0.6 s
+    // on MiMo and 7.8 s on Luna. The watchdog itself was off for every provider
+    // but Anthropic's before Claude Code 2.1.196, hence the explicit 1.
+    CLAUDE_ENABLE_STREAM_WATCHDOG: '1',
+    CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS: '120000',
     // Claude Code only knows the context window of models in its own catalogue.
     // An OpenRouter slug is not in it, so without this it assumes 200k and
     // auto-compacts a 1.3M-token model at a sixth of its real window. The number
@@ -520,7 +651,15 @@ function routingEnv(key, main, opus, contextTokens) {
 
 const ROUTING_KEYS = Object.keys(routingEnv('', '', '', 0));
 
-function writeClaudeSettings(key, main, opus, contextTokens, mutate) {
+// Written by earlier versions and no longer wanted. Removed on every install,
+// and by --off and --uninstall, so no machine keeps one.
+const LEGACY_ENV_KEYS = ['CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC'];
+
+// Anything that stops Claude Code updating itself. An install removes these
+// unless it was run with --no-autoupdate.
+const UPDATE_BLOCKERS = ['DISABLE_AUTOUPDATER', 'DISABLE_UPDATES', ...LEGACY_ENV_KEYS];
+
+function writeClaudeSettings(key, main, opus, contextTokens, sha, mutate) {
   const prev = readJson(CLAUDE_SETTINGS, {});
   const bak = backup(CLAUDE_SETTINGS);
 
@@ -529,7 +668,16 @@ function writeClaudeSettings(key, main, opus, contextTokens, mutate) {
   if (typeof env.ANTHROPIC_BASE_URL === 'string' && /127\.0\.0\.1|localhost/.test(env.ANTHROPIC_BASE_URL)) {
     info('replacing a stale local proxy URL from an older install');
   }
-  Object.assign(env, routingEnv(key, main, opus, contextTokens));
+  // Object.assign below only adds and overwrites, so a variable an earlier
+  // version wrote stays forever unless it is deleted here.
+  const blockers = hasFlag('--no-autoupdate') ? LEGACY_ENV_KEYS : UPDATE_BLOCKERS;
+  const unblocked = blockers.filter((k) => k in env);
+  for (const k of unblocked) delete env[k];
+  if (unblocked.length) {
+    const still = UPDATE_BLOCKERS.some((k) => k in env);
+    info(`${still ? '' : 'Claude Code updates itself again: '}removed ${unblocked.join(', ')}`);
+  }
+  Object.assign(env, routingEnv(key, main, opus, contextTokens, sha));
 
   const next = { ...prev, env };
   next.statusLine = { type: 'command', command: nodeCommand(STATUSLINE), padding: 0 };
@@ -543,6 +691,7 @@ function writeClaudeSettings(key, main, opus, contextTokens, mutate) {
 
   writeJson(CLAUDE_SETTINGS, next);
   if (bak) info(`previous settings backed up to ${path.basename(bak)}`);
+  pruneRoutedBackups();
 }
 
 // ---------------------------------------------------------------------------
@@ -555,7 +704,7 @@ const STATUSLINE_SOURCE = String.raw`#!/usr/bin/env node
  *
  * Reads the documented status line payload on stdin and prints one line:
  *
- *   ● mimo-v2.6-pro (default) | ctx 12% | cache 91% | proj | main | v59f677b
+ *   * mimo-v2.6-pro (default) | v59f677b cc 2.1.280 | ctx 12% | cache 91% | proj | main
  *
  * Every field here is one Claude Code documents for status lines
  * (context_window.used_percentage, prompt_cache.hit_ratio, cost.total_cost_usd,
@@ -600,10 +749,11 @@ function main() {
   const parts = [];
 
   // caveman, when installed, writes a flag file. Show its state rather than let
-  // two status lines fight over the same row.
+  // two status lines fight over the same row. Only a mode name is ever shown:
+  // whatever else that file holds is not printed to the screen.
   try {
     const level = fs.readFileSync(path.join(os.homedir(), '.claude', '.caveman-active'), 'utf8').trim();
-    if (level) {
+    if (/^[a-z-]{1,16}$/i.test(level)) {
       const tag = level.toUpperCase() === 'FULL' ? '' : ':' + level.toUpperCase();
       parts.push(C.yellow + '[CAVEMAN' + tag + ']' + C.reset);
     }
@@ -613,6 +763,37 @@ function main() {
     (routed ? C.green : C.yellow) + '*' + C.reset + ' ' +
     C.bold + short + C.reset + C.dim + ' (' + tier + ')' + C.reset
   );
+
+  // Versions, always, and right after the model: they are what a screenshot of
+  // a problem needs to show, and a narrow terminal cuts the end of the line.
+  //
+  // The setup's commit comes from its state file, which is what is on disk.
+  // CLAUDE_OPENROUTER_VERSION comes from settings.json as this session loaded it,
+  // so when an update has installed since, the two differ and the line says to
+  // restart -- rather than showing the new version while the old one runs.
+  let st = {};
+  try {
+    st = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'openrouter-setup-state.json'), 'utf8')) || {};
+  } catch {}
+  const installed = st.sha ? String(st.sha).slice(0, 7) : '';
+  const running = /^[0-9a-f]{7}$/.test(process.env.CLAUDE_OPENROUTER_VERSION || '') ? process.env.CLAUDE_OPENROUTER_VERSION : '';
+  let ver = 'v' + (running || installed || '?');
+  let verColour = C.dim;
+  if (running && installed && running !== installed) {
+    ver += ' (restart for v' + installed + ')';
+    verColour = C.yellow;
+  }
+  if (st.outdated && st.latest) {
+    if (st.failedSha === st.latest) {
+      ver += ' update failed';
+      verColour = C.red;
+    } else {
+      ver += ' updating';
+      verColour = C.yellow;
+    }
+  }
+  const cc = typeof input.version === 'string' ? input.version : (input.version && input.version.VERSION) || '';
+  parts.push(verColour + ver + C.reset + (cc ? C.dim + ' cc ' + cc + C.reset : ''));
 
   // Context window: what drives compaction.
   const cw = input.context_window || {};
@@ -648,15 +829,6 @@ function main() {
   const cost = input.cost && typeof input.cost.total_cost_usd === 'number' ? input.cost.total_cost_usd : null;
   if (cost !== null && cost > 0) parts.push(C.dim + USD + cost.toFixed(4) + C.reset);
 
-  // This project's installed version, and whether an update is pending.
-  try {
-    const st = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.claude', 'openrouter-setup-state.json'), 'utf8'));
-    if (st.sha) {
-      const v = 'v' + String(st.sha).slice(0, 7);
-      parts.push(st.outdated ? C.yellow + v + ' up!' + C.reset : C.dim + v + C.reset);
-    }
-  } catch {}
-
   process.stdout.write(parts.join(C.dim + ' | ' + C.reset));
 }
 
@@ -688,7 +860,9 @@ const LANG_END = '<!-- END claude-openrouter: language -->';
 // Models whose training is heavily Chinese and which drift into it mid-answer.
 // Observed: a reply to an English question about a slash command came back
 // entirely in Chinese, in the visible answer rather than a reasoning block.
-const DRIFTS_LANGUAGE = /^(deepseek|z-ai|qwen|moonshot|baidu|01-ai|tencent)\//i;
+// xiaomi was missing when MiMo became the default, so installs since then got
+// no note at all, while the README said they did.
+const DRIFTS_LANGUAGE = /^(deepseek|z-ai|qwen|moonshot|baidu|01-ai|tencent|xiaomi)\//i;
 
 const LANG_BODY = [
   LANG_BEGIN,
@@ -839,8 +1013,7 @@ function removePromptExtras(settings, cavemanSrc) {
 const CLAUDE_JSON = path.join(HOME, '.claude.json');
 
 function installedSha() {
-  const st = readJson(STATE_FILE, null) || readJson(LEGACY_STATE_FILE, {});
-  return st.sha || null;
+  return readState().sha || null;
 }
 
 function shortSha(sha) {
@@ -862,7 +1035,8 @@ ${C.yellow}Could not reach GitHub, so this cannot be compared.${C.reset}`);
   }
   if (!local) {
     console.log(`
-${C.yellow}No installed version recorded.${C.reset} Re-run the setup to record one.`);
+${C.yellow}The installed version is not known.${C.reset} This copy could not be matched to a`);
+    console.log('commit on GitHub, so the session-start updater replaces it with one that can.');
     return;
   }
   if (local === remote) {
@@ -912,7 +1086,7 @@ function modeTrim() {
   // Positional arguments name the servers to keep — but --key takes a value,
   // and without this the key itself is read as a server name and the command
   // dies with "No such MCP server: sk-or-v1-...".
-  const VALUE_FLAGS = ['--key'];
+  const VALUE_FLAGS = ['--key', '--sha'];
   const positional = argv.filter((a, i) => {
     if (a.startsWith('--')) return false;
     return !VALUE_FLAGS.includes(argv[i - 1]);
@@ -940,7 +1114,7 @@ Keep only the ones you name:`);
   }
 
   const bak = backup(CLAUDE_JSON);
-  const stash = readJson(STATE_FILE, {});
+  const stash = readState();
   stash.trimmedMcp = stash.trimmedMcp || {};
 
   const removed = [];
@@ -952,7 +1126,7 @@ Keep only the ones you name:`);
   }
   cfg.mcpServers = servers;
   writeJson(CLAUDE_JSON, cfg);
-  writeJson(STATE_FILE, stash);
+  writeState(stash);
 
   console.log(removed.length
     ? `${C.green}Disabled:${C.reset} ${removed.join(', ')}`
@@ -963,7 +1137,7 @@ Keep only the ones you name:`);
 }
 
 function modeUntrim() {
-  const stash = readJson(STATE_FILE, {});
+  const stash = readState();
   const saved = stash.trimmedMcp || {};
   if (!Object.keys(saved).length) {
     console.log('Nothing was trimmed, so there is nothing to restore.');
@@ -973,7 +1147,7 @@ function modeUntrim() {
   cfg.mcpServers = { ...(cfg.mcpServers || {}), ...saved };
   writeJson(CLAUDE_JSON, cfg);
   delete stash.trimmedMcp;
-  writeJson(STATE_FILE, stash);
+  writeState(stash);
   console.log(`${C.green}Restored:${C.reset} ${Object.keys(saved).join(', ')}`);
 }
 
@@ -1262,6 +1436,175 @@ async function modeUsage() {
 }
 
 // ---------------------------------------------------------------------------
+// Guard: a reply that printed a tool call instead of making it
+// ---------------------------------------------------------------------------
+
+/**
+ * A Stop hook that catches one specific failure and asks the model to retry.
+ *
+ * Models served through OpenRouter sometimes write a tool call out as text, in
+ * their own native syntax -- DeepSeek's DSML, for one -- instead of making the
+ * call. The provider never turns it into a tool call, so nothing runs, the turn
+ * ends normally, and the person sees markup where the answer should be:
+ *
+ *     ??</|DSML|parameter> </|DSML|invoke> </|DSML|tool_calls>
+ *
+ * Claude Code re-asks by itself when a reply is empty, but this reply is not
+ * empty, so it stands as the answer and the session looks dead. This blocks
+ * that stop once, with a reason the model reads, so it tries again. It acts only
+ * on markup that never occurs in prose, found outside code blocks, and never
+ * twice in a row: on the retry stop_hook_active is true, and then it always lets
+ * the turn end.
+ */
+const GUARD_HOOK_SOURCE = String.raw`#!/usr/bin/env node
+/**
+ * openrouter-guard.js — generated by setup.js. Re-run the installer to change it.
+ *
+ * Stop hook. When the model's last reply printed a tool call as text instead of
+ * making it, block the stop once so that the model tries again. Otherwise it
+ * prints nothing and changes nothing. Each retry is logged to
+ * ~/.claude/openrouter-guard.log
+ */
+'use strict';
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+const LOG = path.join(os.homedir(), '.claude', 'openrouter-guard.log');
+const NL = String.fromCharCode(10);
+const TICK = String.fromCharCode(96);
+const TAIL_BYTES = 1024 * 1024;
+
+// Fragments of models' own tool-call syntax. None of them occurs in ordinary prose.
+const LEAKS = [
+  ['dsml', /[|｜]\s*DSML\s*[|｜]/i],
+  ['deepseek', /[|｜]\s*tool▁(?:calls?|sep|outputs?)/i],
+  ['kimi', /<\|tool_calls?_(?:section_)?(?:begin|end)\|>|<\|tool_call_argument_begin\|>/i],
+  ['harmony', /<\|(?:channel|constrain|call)\|>/],
+  ['hermes', /<tool_call>\s*\{[\s\S]{0,400}?"name"\s*:/],
+  ['glm', /<arg_key>[\s\S]{0,400}?<\/arg_key>/],
+  ['xml', new RegExp('<' + 'function_calls>[\\s\\S]{0,400}?<' + 'invoke\\s+name=')],
+  ['mistral', /\[TOOL_CALLS\]/],
+  ['llama', /<\|python_tag\|>/],
+];
+
+const REASON =
+  'Your last reply contained a tool call written out as text, in raw tool-call markup, ' +
+  'so the tool never ran and the person saw only the markup. Never put tool-call markup ' +
+  'in a reply. If you still need the tool, call it now through the tool interface. ' +
+  'Otherwise reply in plain words: answer the question, or say briefly what you did.';
+
+// What the person read: everything outside fenced and inline code, which is
+// where a model explaining one of these formats would put an example.
+function prose(text) {
+  const fence = new RegExp(TICK + '{3}[\\s\\S]*?(?:' + TICK + '{3}|$)', 'g');
+  const inline = new RegExp(TICK + '[^' + TICK + '\\n]*' + TICK, 'g');
+  return String(text).replace(fence, ' ').replace(inline, ' ');
+}
+
+function readTail(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, TAIL_BYTES);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    return buf.toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// Something the person typed, as opposed to a tool result, which is also
+// written as a "user" entry but sits in the middle of a turn.
+function isPrompt(e) {
+  if (e.type !== 'user' || e.isMeta || e.isSidechain) return false;
+  const c = e.message && e.message.content;
+  if (typeof c === 'string') return true;
+  return Array.isArray(c) && c.some((b) => b && b.type === 'text');
+}
+
+// The text of the final assistant message of this turn, from the transcript,
+// for Claude Code versions whose Stop payload does not carry it. It never looks
+// past the start of the turn, so an older reply is never judged again.
+function lastFromTranscript(file) {
+  const lines = readTail(file).split(NL);
+  const parts = [];
+  let id;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let e;
+    try { e = JSON.parse(lines[i]); } catch { continue; }
+    if (isPrompt(e)) break;
+    if (e.type !== 'assistant' || e.isSidechain) continue;
+    const m = e.message || {};
+    if (id === undefined) id = m.id || null;
+    else if ((m.id || null) !== id) break;
+    const c = m.content;
+    if (typeof c === 'string') parts.unshift(c);
+    else if (Array.isArray(c)) {
+      for (let j = c.length - 1; j >= 0; j--) {
+        if (c[j] && c[j].type === 'text' && c[j].text) parts.unshift(c[j].text);
+      }
+    }
+  }
+  return parts.join(NL);
+}
+
+function decide(raw) {
+  let input;
+  try { input = raw.trim() ? JSON.parse(raw) : {}; } catch { return null; }
+  // Already a retry: always let this one end.
+  if (input.stop_hook_active) return null;
+  if (input.hook_event_name && input.hook_event_name !== 'Stop') return null;
+  let text = typeof input.last_assistant_message === 'string' ? input.last_assistant_message : null;
+  if (text === null && input.transcript_path) {
+    try { text = lastFromTranscript(input.transcript_path); } catch { text = null; }
+  }
+  if (!text) return null;
+  const seen = prose(text);
+  const hit = LEAKS.find((l) => l[1].test(seen));
+  if (!hit) return null;
+  try {
+    fs.appendFileSync(LOG, JSON.stringify({
+      ts: new Date().toISOString(),
+      session: input.session_id || null,
+      format: hit[0],
+      sample: text.slice(0, 120),
+    }) + NL);
+  } catch {}
+  return { decision: 'block', reason: REASON };
+}
+
+let buf = '';
+let done = false;
+function finish() {
+  if (done) return;
+  done = true;
+  let out = null;
+  try { out = decide(buf); } catch {}
+  if (out) process.stdout.write(JSON.stringify(out));
+  // Let go of stdin so the process can end; see openrouter-usage.js.
+  try { process.stdin.pause(); } catch {}
+}
+
+// Never outlive the host's hook timeout waiting for a stream to close.
+const guard = setTimeout(finish, 1500);
+if (typeof guard.unref === 'function') guard.unref();
+
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (c) => { buf += c; });
+process.stdin.on('error', finish);
+process.stdin.on('end', () => { clearTimeout(guard); finish(); });
+`;
+
+function installGuard(settings) {
+  writeGenerated(GUARD_HOOK, GUARD_HOOK_SOURCE, 'guard hook');
+  setHook(settings, 'Stop', 'openrouter-guard',
+    { type: 'command', command: nodeCommand(GUARD_HOOK), timeout: 5 });
+  ok('reply guard installed (a reply that prints a tool call as text is retried once)');
+}
+
+// ---------------------------------------------------------------------------
 // Auto-update
 // ---------------------------------------------------------------------------
 
@@ -1269,14 +1612,20 @@ async function modeUsage() {
  * A SessionStart hook that keeps this setup current.
  *
  * Claude Code reads its settings before any hook runs, so an update can only
- * ever take effect from the NEXT session. The earlier version accepted that
- * silently: it checked at most every six hours, in the background, and told
- * no one -- so a laptop opened once a week for a class was always one update
- * behind, and nobody in the room knew. Now, when a check is due (at most every
- * thirty minutes), the hook asks GitHub itself, capped at 1.5 seconds; if there
- * is a newer commit it starts the reinstall in the background and says so on
- * screen, so the person knows to restart. Every path still swallows its errors:
- * a slow or absent network costs at most that 1.5 seconds, never the session.
+ * ever take effect from the NEXT session. When a check is due (at most every
+ * thirty minutes) the hook asks GitHub, capped at 1.5 seconds; if there is a
+ * newer commit it starts the reinstall in the background and says so on
+ * screen, so the person knows to restart.
+ *
+ * Two things used to stop updates arriving at all. A check that ran out of its
+ * 1.5 seconds -- a slow school network, a cold start -- gave up until thirty
+ * minutes later, so a laptop opened only for class could go weeks without one
+ * succeeding. And it asked only GitHub's REST API, which allows 60
+ * unauthenticated requests an hour per address: behind a school or campus
+ * address shared by hundreds of machines, that is refused most of the time.
+ * Now the first question goes to git's own ref listing, which that allowance
+ * does not count, the API is the fallback, and a check that cannot finish in
+ * time hands over to a background retry that nobody is waiting on.
  */
 const AUTOUPDATE_SOURCE = String.raw`#!/usr/bin/env node
 /**
@@ -1292,29 +1641,63 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const REPO = '__REPO__';
-const RAW_BASE = '__RAW_BASE__';
 const CHECK_EVERY_MS = 30 * 60 * 1000;   // thirty minutes
 const ASK_TIMEOUT_MS = 1500;             // the most a check may hold up a session
+const PATIENT_TIMEOUT_MS = 20000;        // the background retry, which nobody waits on
 const DIR = path.join(os.homedir(), '.claude');
 const STATE = path.join(DIR, 'openrouter-setup-state.json');
 const LOG = path.join(DIR, 'openrouter-autoupdate.log');
 
 function readState() {
-  try { return JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { return {}; }
+  try { return JSON.parse(fs.readFileSync(STATE, 'utf8')) || {}; } catch { return {}; }
 }
+// Whole or not at all: the statusline reads this file every few seconds.
 function writeState(s) {
-  try { fs.writeFileSync(STATE, JSON.stringify(s, null, 2) + '\n', { mode: 0o600 }); } catch {}
+  const body = JSON.stringify(s, null, 2) + '\n';
+  const tmp = STATE + '.' + process.pid + '.tmp';
+  try {
+    fs.writeFileSync(tmp, body, { mode: 0o600 });
+    fs.renameSync(tmp, STATE);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch {}
+    try { fs.writeFileSync(STATE, body, { mode: 0o600 }); } catch {}
+  }
 }
 function log(msg) {
   try { fs.appendFileSync(LOG, new Date().toISOString() + ' ' + msg + '\n'); } catch {}
 }
 
-// Ask GitHub for the newest commit on main, sending the ETag from last time so
-// an unchanged answer is a bodiless 304. That saves bandwidth only: without an
-// Authorization header a 304 still counts against the 60-an-hour allowance per
-// address, so the thirty-minute spacing is what keeps a room of laptops behind
-// one school address under it (two checks an hour each).
-async function newestSha(state, timeoutMs) {
+// Runs this file again on its own, so the hook can return at once.
+// windowsHide: no console window appears on the desktop while it works.
+function spawnSelf(args) {
+  try {
+    const child = spawn(process.execPath, [__filename].concat(args), {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+  } catch (err) {
+    log('could not start ' + args.join(' ') + ': ' + err.message);
+  }
+}
+
+// The newest commit on main from git's own ref listing -- the request every
+// clone makes, which the REST API's 60-an-hour allowance does not count.
+async function fromGit(timeoutMs) {
+  const res = await fetch('https://github.com/' + REPO + '.git/info/refs?service=git-upload-pack', {
+    headers: { 'user-agent': 'git/2.45 claude-openrouter-autoupdate' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error('git refs HTTP ' + res.status);
+  const m = /([0-9a-f]{40}) refs\/heads\/main(?![\w\/.-])/.exec(await res.text());
+  if (!m) throw new Error('git refs: no main branch listed');
+  return m[1];
+}
+
+// The same from the REST API, sending the ETag from last time. That saves
+// bandwidth only: without an Authorization header a 304 still counts.
+async function fromApi(state, timeoutMs) {
   const headers = { accept: 'application/vnd.github+json', 'user-agent': 'claude-openrouter-autoupdate' };
   if (state.etag && state.latestSeen) headers['if-none-match'] = state.etag;
   const res = await fetch('https://api.github.com/repos/' + REPO + '/commits/main', {
@@ -1322,16 +1705,48 @@ async function newestSha(state, timeoutMs) {
     signal: AbortSignal.timeout(timeoutMs),
   });
   if (res.status === 304) return state.latestSeen;
-  if (!res.ok) throw new Error('HTTP ' + res.status);
+  if (!res.ok) throw new Error('api HTTP ' + res.status);
   const sha = (await res.json()).sha || null;
   state.etag = res.headers.get('etag') || null;
   state.latestSeen = sha;
   return sha;
 }
 
-// --- parent: decide, and tell the person ----------------------------------
+// Git first, the API second, both inside one deadline.
+async function newestSha(state, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  const left = () => Math.max(250, deadline - Date.now());
+  try {
+    return await fromGit(left());
+  } catch (err) {
+    log('check via git failed: ' + err.message);
+  }
+  return fromApi(state, left());
+}
+
+function upToDate(state, sha) {
+  if (state.outdated) {
+    state.outdated = false;
+    writeState(state);
+  }
+  log('up to date (' + sha.slice(0, 7) + ')');
+}
+
+// Flag it at once, so the statusline says so even if the reinstall fails or
+// the machine goes offline for the rest of the session.
+function markOutdated(state, sha) {
+  state.outdated = true;
+  state.latest = sha;
+  writeState(state);
+  log('update available: ' + String(state.sha).slice(0, 7) + ' -> ' + sha.slice(0, 7));
+}
+
+// --- parent: decide quickly, and tell the person ----------------------------
 async function check() {
   const state = readState();
+  // Switched back to an Anthropic account with --off. A reinstall now would
+  // switch it straight back to OpenRouter, so stay out of the way until --on.
+  if (state.off) return;
   const due = !state.lastCheck || Date.now() - state.lastCheck > CHECK_EVERY_MS;
   if (!due) return;
   state.lastCheck = Date.now();
@@ -1341,34 +1756,17 @@ async function check() {
   try {
     sha = await newestSha(state, ASK_TIMEOUT_MS);
   } catch (err) {
-    return log('check failed: ' + err.message);
+    // Out of time, or refused. Retry in the background now, rather than leave
+    // it to the next session thirty minutes from now to fail the same way.
+    log('quick check failed: ' + err.message + ' -- retrying in the background');
+    return spawnSelf(['--check']);
   }
   writeState(state);
   if (!sha) return log('check failed: no sha in response');
+  if (sha === state.sha) return upToDate(state, sha);
 
-  if (sha === state.sha) {
-    if (state.outdated) {
-      state.outdated = false;
-      writeState(state);
-    }
-    return log('up to date (' + sha.slice(0, 7) + ')');
-  }
-
-  // Flag it immediately so the statusline says so even if the reinstall
-  // fails or the machine is offline for the rest of the session.
-  state.outdated = true;
-  state.latest = sha;
-  writeState(state);
-  log('update available: ' + String(state.sha).slice(0, 7) + ' -> ' + sha.slice(0, 7));
-
-  // The reinstall takes longer than a hook may, so it runs on its own.
-  // windowsHide: no console window appears on the desktop while it works.
-  const child = spawn(process.execPath, [__filename, '--run', sha], {
-    detached: true,
-    stdio: 'ignore',
-    windowsHide: true,
-  });
-  child.unref();
+  markOutdated(state, sha);
+  spawnSelf(['--run', sha]);
 
   // This session already started on the old setup. Say so on screen -- a
   // systemMessage is shown to the person, unlike plain output -- so whoever is
@@ -1383,7 +1781,24 @@ async function check() {
   process.stdout.write(JSON.stringify({ systemMessage }));
 }
 
-// --- child: download and reinstall one known commit ----------------------
+// --- child: the same check, with time to finish -----------------------------
+async function patientCheck() {
+  const state = readState();
+  if (state.off) return;
+  let sha;
+  try {
+    sha = await newestSha(state, PATIENT_TIMEOUT_MS);
+  } catch (err) {
+    return log('background check failed: ' + err.message);
+  }
+  writeState(state);
+  if (!sha) return log('background check failed: no sha in response');
+  if (sha === state.sha) return upToDate(state, sha);
+  markOutdated(state, sha);
+  await install(sha);
+}
+
+// --- child: download and reinstall one known commit -------------------------
 //
 // One reinstall at a time. Two sessions started together -- a terminal and the
 // VS Code extension -- would otherwise run two installers writing the same
@@ -1446,9 +1861,10 @@ async function reinstall(sha) {
   const ok = await new Promise((resolve) => {
     // Replay the options this machine was installed with. Without them the
     // update quietly reinstalls the defaults, undoing --reliable, --extras and
-    // --usagelog on a machine whose owner explicitly asked for them.
+    // --usagelog on a machine whose owner explicitly asked for them. --sha says
+    // which commit this is, so the new copy records exactly that.
     const saved = Array.isArray(state.options) ? state.options.filter((f) => /^--[a-z-]+$/.test(f)) : [];
-    const args = [tmp, '--no-verify', '--no-launch', '--quiet'].concat(saved);
+    const args = [tmp, '--no-verify', '--no-launch', '--quiet', '--sha', sha].concat(saved);
     const child = spawn(process.execPath, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
@@ -1482,10 +1898,11 @@ function autoupdateSource() {
   // Assembled rather than templated so the child-mode dispatch stays readable.
   const body = AUTOUPDATE_SOURCE
     .replace('__REPO__', REPO)
-    .replace('__RAW_BASE__', RAW_BASE)
     .replace('if (process.argv includes_marker) {}', `
 if (process.argv[2] === '--run') {
   install(process.argv[3]).catch((err) => log('unexpected: ' + err.message));
+} else if (process.argv[2] === '--check') {
+  patientCheck().catch((err) => log('unexpected: ' + err.message));
 } else {
   // Parent path: a check at most every thirty minutes, capped at 1.5 seconds.
   check().catch((err) => log('unexpected: ' + err.message));
@@ -1506,7 +1923,7 @@ if (process.argv[2] === '--run') {
   return body;
 }
 
-function installAutoupdate(settings, sha) {
+function installAutoupdate(settings) {
   writeGenerated(AUTOUPDATE, autoupdateSource(), 'auto-update hook');
   setHook(settings, 'SessionStart', 'openrouter-autoupdate', {
     type: 'command',
@@ -1514,17 +1931,30 @@ function installAutoupdate(settings, sha) {
     timeout: 5,
     statusMessage: 'Checking for setup updates...',
   });
+  ok('auto-update installed (checked at session start, at most every thirty minutes)');
+}
 
-  const state = readJson(STATE_FILE, {});
-  state.sha = sha || state.sha || null;
+/**
+ * Record what was just installed, whether or not the updater is.
+ *
+ * This used to happen only while installing the updater, so --no-autoupdate
+ * left no version at all for the statusline to show; and --off and --on rewrote
+ * the file from scratch, which threw away the version, the saved options and
+ * any MCP servers --trim had stashed there.
+ */
+function recordInstall(sha) {
+  const state = readState();
+  state.sha = sha || null;
   state.outdated = false;
-  state.lastCheck = Date.now();
+  state.off = false;
+  // A copy that could not be matched to a commit is checked at the very next
+  // session start, rather than thirty minutes from now.
+  state.lastCheck = sha ? Date.now() : 0;
+  if (sha && state.failedSha === sha) delete state.failedSha;
   // Remember the choices, so an unattended update reapplies them instead of
   // resetting the machine to defaults.
-  state.options = ['--reliable', '--extras', '--efficient', '--usagelog'].filter(hasFlag);
-  writeJson(STATE_FILE, state);
-
-  ok(`auto-update installed${sha ? ` (pinned at ${sha.slice(0, 7)})` : ''}`);
+  state.options = SAVED_OPTIONS.filter(hasFlag);
+  writeState(state);
 }
 
 /** Current commit on main, or null if GitHub is unreachable. */
@@ -1534,8 +1964,45 @@ async function currentSha() {
       headers: { accept: 'application/vnd.github+json', 'user-agent': 'claude-openrouter-setup' },
       signal: AbortSignal.timeout(15000),
     });
+    if (res.ok) return (await res.json()).sha || null;
+  } catch {}
+  // Refused or unreachable: git's ref listing is not counted against the API's
+  // 60-an-hour allowance, which a school address can exhaust on its own.
+  try {
+    const res = await fetch(`https://github.com/${REPO}.git/info/refs?service=git-upload-pack`, {
+      headers: { 'user-agent': 'git/2.45 claude-openrouter-setup' },
+      signal: AbortSignal.timeout(15000),
+    });
     if (!res.ok) return null;
-    return (await res.json()).sha || null;
+    const m = /([0-9a-f]{40}) refs\/heads\/main(?![\w/.-])/.exec(await res.text());
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The commit this very file came from, or null when that cannot be shown.
+ *
+ * "The newest commit on GitHub" is not the same thing. The bootstrappers fetch
+ * setup.js from the raw /main/ URL, which a CDN keeps serving for minutes after
+ * a push, so an install in that window ran the previous file while recording
+ * the new commit -- and the updater, seeing the two equal, never replaced it.
+ * So the newest commit is believed only when its setup.js is this file, byte for
+ * byte. The updater passes --sha because it downloaded exactly that commit.
+ */
+async function ownSha() {
+  const given = flagValue('--sha');
+  if (given && /^[0-9a-f]{40}$/.test(given)) return given;
+  const head = await currentSha();
+  if (!head) return null;
+  try {
+    const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${head}/setup.js`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return null;
+    const lf = (s) => s.replace(/\r\n/g, '\n');
+    return lf(await res.text()) === lf(fs.readFileSync(__filename, 'utf8')) ? head : null;
   } catch {
     return null;
   }
@@ -1571,9 +2038,12 @@ const HOOKS_DIR = path.join(CLAUDE_DIR, 'hooks');
  * skip notice. Rather than make the flag a lie on the most common path, the
  * files are fetched from the same commit the rest of the install came from.
  */
-async function ensureCavemanFiles() {
+async function ensureCavemanFiles(sha) {
   const local = path.join(__dirname, 'extras', 'caveman');
   if (fs.existsSync(local)) return local;
+  // The commit this install is, when known. The /main/ URL can serve older
+  // files for minutes after a push.
+  const base = sha ? `https://raw.githubusercontent.com/${REPO}/${sha}` : RAW_BASE;
 
   const dest = path.join(os.tmpdir(), 'claude-openrouter-extras-' + Date.now());
   try {
@@ -1585,7 +2055,7 @@ async function ensureCavemanFiles() {
   let got = 0;
   for (const f of CAVEMAN_FILES) {
     try {
-      const res = await fetch(`${RAW_BASE}/extras/caveman/${f}`, {
+      const res = await fetch(`${base}/extras/caveman/${f}`, {
         signal: AbortSignal.timeout(20000),
       });
       if (!res.ok) continue;
@@ -1718,30 +2188,52 @@ function modeOff() {
       delete s.env[k];
     }
   }
+  for (const k of LEGACY_ENV_KEYS) delete s.env[k];
   if (s.__parkedModel) {
     s.model = s.__parkedModel;
     delete s.__parkedModel;
   }
   writeJson(CLAUDE_SETTINGS, s);
-  writeJson(STATE_FILE, { off: true, parked, at: new Date().toISOString() });
+  // Merged, not replaced: the file also holds the installed version, the saved
+  // options and any MCP servers --trim stashed, and writing it from scratch here
+  // lost all three. off:true also tells the updater to leave this machine alone.
+  writeState({ ...readState(), off: true, parked, at: new Date().toISOString() });
   console.log(`${C.green}Routing off.${C.reset} Claude Code is back on your Anthropic account.`);
   console.log(`${C.dim}Open a new terminal, or reload the VSCode window.${C.reset}`);
 }
 
 function modeOn() {
-  const state = readJson(STATE_FILE, null) || readJson(LEGACY_STATE_FILE, {});
+  const state = readState();
   if (!state.parked || !state.parked.ANTHROPIC_AUTH_TOKEN) {
     die('Nothing saved to switch back to.', 'Run a full install:  node setup.js --key sk-or-v1-...');
   }
+  const parked = { ...state.parked };
+  for (const k of LEGACY_ENV_KEYS) delete parked[k];
   const s = readJson(CLAUDE_SETTINGS, {});
-  s.env = { ...(s.env || {}), ...state.parked };
+  s.env = { ...(s.env || {}), ...parked };
   if (s.model) {
     s.__parkedModel = s.model;
     delete s.model;
   }
   writeJson(CLAUDE_SETTINGS, s);
-  writeJson(STATE_FILE, { off: false, parked: state.parked, at: new Date().toISOString() });
+  writeState({ ...state, off: false, parked, at: new Date().toISOString() });
   console.log(`${C.green}Routing on.${C.reset} Open a new terminal, or reload the VSCode window.`);
+}
+
+const hooked = (settings, marker) => JSON.stringify(settings.hooks || {}).includes(marker);
+
+/** What stops Claude Code updating itself on this machine, or null if nothing does. */
+function claudeUpdateBlocker(env) {
+  for (const k of UPDATE_BLOCKERS) {
+    if (env[k]) return `${k} in settings.json`;
+    if (process.env[k]) return `${k} in your environment`;
+  }
+  try {
+    if (JSON.parse(fs.readFileSync(CLAUDE_JSON, 'utf8')).autoUpdates === false) {
+      return 'autoUpdates: false in ~/.claude.json';
+    }
+  } catch {}
+  return null;
 }
 
 function modeStatus() {
@@ -1760,6 +2252,12 @@ function modeStatus() {
     ? Number(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toLocaleString() + ' tokens' : '-');
   line('key', env.ANTHROPIC_AUTH_TOKEN ? env.ANTHROPIC_AUTH_TOKEN.slice(0, 12) + '...' : '-');
   line('statusline', (s.statusLine && s.statusLine.command) || '-');
+  const st = readState();
+  line('version', `${shortSha(st.sha)}${st.outdated && st.latest ? ` (update to ${shortSha(st.latest)} pending)` : ''}`);
+  line('self-update', hooked(s, 'openrouter-autoupdate') ? (st.off ? 'paused while routing is off' : 'on') : 'off');
+  const blocker = claudeUpdateBlocker(env);
+  line('claude update', blocker ? `${C.yellow}OFF (${blocker})${C.reset}` : 'on');
+  line('reply guard', hooked(s, 'openrouter-guard') ? 'on' : 'off');
   if (env.ANTHROPIC_BASE_URL && /127\.0\.0\.1|localhost/.test(env.ANTHROPIC_BASE_URL)) {
     console.log(`\n${C.red}This points at a local proxy that this version no longer installs.${C.reset}`);
     console.log(`Re-run the setup to fix it, or ${C.bold}node setup.js --off${C.reset} to go back to Anthropic.`);
@@ -1801,6 +2299,15 @@ async function modeDoctor() {
   }
   line('statusline', fs.existsSync(STATUSLINE) ? STATUSLINE : 'not present', fs.existsSync(STATUSLINE));
   line('CLAUDE.md', fs.existsSync(CLAUDE_MD) ? CLAUDE_MD : 'not present', fs.existsSync(CLAUDE_MD));
+  const st = readState();
+  line('setup version', st.sha ? shortSha(st.sha) : 'unknown (replaced at the next session start)', Boolean(st.sha));
+  const selfUpdate = hooked(s, 'openrouter-autoupdate') && fs.existsSync(AUTOUPDATE);
+  line('self-update', selfUpdate ? (st.off ? 'paused while routing is off' : 'on') : 'OFF', selfUpdate);
+  if (st.failedSha) line('last update', `FAILED for ${shortSha(st.failedSha)} — see ~/.claude/openrouter-autoupdate.log`, false);
+  const blocker = claudeUpdateBlocker(env);
+  line('claude update', blocker ? `OFF (${blocker})` : 'on', !blocker);
+  const guard = hooked(s, 'openrouter-guard') && fs.existsSync(GUARD_HOOK);
+  line('reply guard', guard ? 'on' : 'off');
 
   let net = false;
   try {
@@ -1848,37 +2355,46 @@ function modeUninstall() {
     .slice()
     .reverse()
     .find((f) => {
-      const cfg = readJson(path.join(CLAUDE_DIR, f), {});
-      const url = (cfg.env || {}).ANTHROPIC_BASE_URL || '';
-      return !/openrouter|127\.0\.0\.1|localhost/.test(url);
+      // A backup that cannot be parsed is skipped, not fatal: one bad file in
+      // that folder used to stop the uninstall altogether.
+      try {
+        JSON.parse(fs.readFileSync(path.join(CLAUDE_DIR, f), 'utf8').replace(/^﻿/, ''));
+      } catch {
+        return false;
+      }
+      return !/openrouter|127\.0\.0\.1|localhost/.test(backupBaseUrl(f));
     });
 
   if (clean) {
     fs.copyFileSync(path.join(CLAUDE_DIR, clean), CLAUDE_SETTINGS);
     console.log(`restored ${CLAUDE_SETTINGS} from ${clean}`);
-  } else if (baks.length) {
-    warn('every backup is itself routed — removing the routing keys instead');
-    const s2 = readJson(CLAUDE_SETTINGS, {});
-    if (s2.env) for (const k of ROUTING_KEYS) delete s2.env[k];
-    if (s2.__parkedModel) {
-      s2.model = s2.__parkedModel;
-      delete s2.__parkedModel;
-    }
-    writeJson(CLAUDE_SETTINGS, s2);
   } else {
-    warn('no settings backup found — removing the routing keys instead');
+    warn(baks.length
+      ? 'every backup is itself routed — removing the routing keys instead'
+      : 'no settings backup found — removing the routing keys instead');
     const s = readJson(CLAUDE_SETTINGS, {});
-    if (s.env) for (const k of ROUTING_KEYS) delete s.env[k];
+    if (s.env) for (const k of [...ROUTING_KEYS, ...LEGACY_ENV_KEYS]) delete s.env[k];
     if (s.__parkedModel) {
       s.model = s.__parkedModel;
       delete s.__parkedModel;
     }
+    // The files go below, so their registrations must go too: a hook or
+    // statusline left pointing at a deleted file errors on every session.
+    for (const [event, marker] of [
+      ['SessionStart', 'openrouter-autoupdate'],
+      ['Stop', 'openrouter-usage'],
+      ['Stop', 'openrouter-guard'],
+    ]) {
+      removeHook(s, event, marker, '');
+    }
+    if (s.hooks && !Object.keys(s.hooks).length) delete s.hooks;
+    if (s.statusLine && JSON.stringify(s.statusLine).includes('statusline-openrouter')) delete s.statusLine;
     writeJson(CLAUDE_SETTINGS, s);
   }
 
   removeLanguageHint();
 
-  for (const f of [STATUSLINE, USAGE_HOOK, AUTOUPDATE]) {
+  for (const f of [STATUSLINE, USAGE_HOOK, AUTOUPDATE, GUARD_HOOK]) {
     try {
       fs.unlinkSync(f);
       console.log(`removed ${f}`);
@@ -1909,7 +2425,11 @@ async function install() {
 
   say('Checking prerequisites');
   checkNode();
-  const claudeBin = ensureClaudeCode();
+  // The unattended updater runs from a hook inside a live Claude Code, so Claude
+  // Code is plainly installed -- and it may be replacing itself at that moment
+  // with its own updater. A probe that caught it mid-update used to fall through
+  // to `npm install -g` in the background, racing that update for the same files.
+  const claudeBin = QUIET ? null : ensureClaudeCode();
 
   const key = resolveKey();
 
@@ -1962,9 +2482,10 @@ async function install() {
     cheap.context_length || 200000,
     dear.context_length || 200000
   );
-  const sha = await currentSha();
-  const cavemanSrc = extras ? await ensureCavemanFiles() : null;
-  writeClaudeSettings(key, main.id, secondary.id, contextTokens, (settings) => {
+  const sha = await ownSha();
+  if (!sha) info('this copy could not be matched to a commit on GitHub; the updater replaces it at the next session start');
+  const cavemanSrc = extras ? await ensureCavemanFiles(sha) : null;
+  writeClaudeSettings(key, main.id, secondary.id, contextTokens, sha, (settings) => {
     if (extras) installCaveman(settings, cavemanSrc);
     else removePromptExtras(settings);
     // Opt-in. It is only accounting, and it has already cost two user-visible
@@ -1972,8 +2493,16 @@ async function install() {
     // that merely reports on the work should be able to disturb the work.
     if (hasFlag('--usagelog')) installUsageLog(settings);
     else removeUsageLog(settings);
-    if (!hasFlag('--no-autoupdate')) installAutoupdate(settings, sha);
+    // On by default, unlike the usage log: it is not accounting, it is the
+    // difference between a session that recovers and one that looks dead.
+    if (!hasFlag('--no-guard')) installGuard(settings);
+    else if (removeHook(settings, 'Stop', 'openrouter-guard', GUARD_HOOK)) ok('reply guard removed (--no-guard)');
+    // A machine reinstalled with --no-autoupdate used to keep the updater it
+    // already had, so the flag did nothing on exactly the machines it was for.
+    if (!hasFlag('--no-autoupdate')) installAutoupdate(settings);
+    else if (removeHook(settings, 'SessionStart', 'openrouter-autoupdate', AUTOUPDATE)) ok('auto-update removed (--no-autoupdate)');
   });
+  recordInstall(sha);
   ok(`${CLAUDE_SETTINGS} -> env.ANTHROPIC_BASE_URL = ${API_ROOT}`);
   info(`default ${main.id} | opus slot ${secondary.id}`);
   info(`context window ${contextTokens.toLocaleString()} tokens`);
@@ -2010,7 +2539,7 @@ async function install() {
 
   out(`\n${C.green}${C.bold}Done.${C.reset}\n`);
   out(`  ${C.bold}version:${C.reset}            ${shortSha(installedSha())}  ${C.dim}(github.com/${REPO})${C.reset}`);
-  out(`  ${C.bold}claude:${C.reset}             ${target}`);
+  out(`  ${C.bold}claude:${C.reset}             ${target}${claudeBin ? `  ${C.dim}(${claudeBin.version})${C.reset}` : ''}`);
   out(`  ${C.bold}settings:${C.reset}           ${CLAUDE_SETTINGS}`);
   out(`  everyday model     : ${main.id}`);
   out(`  the other one      : ${C.cyan}/model opus${C.reset} -> ${secondary.id}`);
@@ -2025,19 +2554,26 @@ async function install() {
     out(`\n  ${C.dim}Start it with:${C.reset} ${C.cyan}claude${C.reset}`);
     return;
   }
-  if (!process.stdout.isTTY) {
+  // On macOS and Linux, Claude Code also needs a terminal on stdin: given a pipe
+  // -- `curl ... | sh` from an older install.sh -- it stops with "Raw mode is not
+  // supported". Better to say how to start it than to end the install on that.
+  if (!process.stdout.isTTY || (!IS_WIN && !process.stdin.isTTY)) {
     out(`\n  ${C.dim}Not an interactive terminal, so not launching. Run:${C.reset} ${C.cyan}claude${C.reset}`);
     return;
   }
 
   out(`\n  ${C.cyan}Starting Claude Code...${C.reset}\n`);
-  const res = spawnSync(target, [], {
+  // A .cmd needs cmd.exe, and cmd.exe splits an unquoted path at its first
+  // space -- so for anyone whose Windows user name has one, this was
+  // "'C:\Users\Jane' is not recognized" instead of Claude Code.
+  const viaShell = IS_WIN && !/\.exe$/i.test(target);
+  const res = spawnSync(viaShell ? `"${target}"` : target, [], {
     stdio: 'inherit',
     // The settings file is written already and a fresh process reads it, but
     // passing the same variables here means this very first session is routed
     // even if something is odd about how settings are picked up.
-    env: { ...process.env, ...routingEnv(key, main.id, secondary.id, contextTokens) },
-    shell: IS_WIN && !/\.exe$/i.test(target),
+    env: { ...process.env, ...routingEnv(key, main.id, secondary.id, contextTokens, sha) },
+    shell: viaShell,
   });
   if (res.error) {
     warn(`could not start Claude Code automatically: ${res.error.message}`);

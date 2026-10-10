@@ -45,11 +45,17 @@ $RawBase = 'https://raw.githubusercontent.com/djerok/claude-openrouter/main'
 function Write-Step($m) { Write-Host "[*] $m" -ForegroundColor Cyan }
 function Write-Ok  ($m) { Write-Host "    ok   $m" -ForegroundColor Green }
 function Write-Warn($m) { Write-Host "    warn $m" -ForegroundColor Yellow }
+
+# Piped into iex, this script runs inside the person's own PowerShell window, and
+# `exit` there closes that window -- taking the error message with it, before
+# anyone can read it. So it exits only when run as a file ($PSCommandPath is set
+# then, and empty under iex); otherwise every caller returns right after Fail.
 function Fail($m, $hint) {
   Write-Host ""
   Write-Host "fatal: $m" -ForegroundColor Red
   if ($hint) { Write-Host $hint -ForegroundColor DarkGray }
-  exit 1
+  $global:LASTEXITCODE = 1
+  if ($PSCommandPath) { exit 1 }
 }
 
 # Installers write to the machine/user environment, not to this already-running
@@ -89,7 +95,9 @@ function Install-Node {
   $arch = if ([Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
   $index = Invoke-RestMethod -Uri 'https://nodejs.org/dist/index.json' -UseBasicParsing
   $lts = $index | Where-Object { $_.lts } | Select-Object -First 1
-  if (-not $lts) { Fail 'Could not determine the current Node LTS version.' 'Install Node manually from https://nodejs.org and re-run.' }
+  # Problems here are warnings: the caller checks for a working Node afterwards
+  # and stops there, with the instructions, if there is none.
+  if (-not $lts) { Write-Warn 'Could not determine the current Node LTS version.'; return }
 
   $url = "https://nodejs.org/dist/$($lts.version)/node-$($lts.version)-$arch.msi"
   $msi = Join-Path $env:TEMP "node-$($lts.version)-$arch.msi"
@@ -98,13 +106,20 @@ function Install-Node {
 
   $size = (Get-Item $msi).Length
   if ($size -lt 5MB) {
-    Fail "The Node installer downloaded only $size bytes — the download was truncated or intercepted." `
-         'If you are behind a proxy, download the installer manually from https://nodejs.org and run it, then re-run this script.'
+    Write-Warn "The Node installer downloaded only $size bytes -- truncated, or replaced by a proxy."
+    return
   }
   Write-Ok "downloaded $([math]::Round($size / 1MB, 1)) MB"
 
+  # /passive, not /qn. Node's MSI installs for all users and needs elevation,
+  # and a fully silent (/qn) install cannot show the UAC prompt, so on any
+  # account that is not already elevated it failed without a word.
   Write-Host '    running the installer (a UAC prompt may appear)' -ForegroundColor DarkGray
-  Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait
+  try {
+    Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /passive /norestart" -Wait
+  } catch {
+    Write-Warn "the Node installer did not run: $($_.Exception.Message)"
+  }
   Remove-Item $msi -ErrorAction SilentlyContinue
 }
 
@@ -116,7 +131,7 @@ $major = Get-NodeMajor
 if ($major -ge $MinNode) {
   Write-Ok "node $(& node --version)"
 } else {
-  if ($major -gt 0) { Write-Warn "node $(& node --version) is older than v$MinNode — upgrading" }
+  if ($major -gt 0) { Write-Warn "node $(& node --version) is older than v$MinNode -- upgrading" }
   else { Write-Warn 'node not found' }
 
   Install-Node
@@ -126,10 +141,11 @@ if ($major -ge $MinNode) {
     Fail 'Node still is not usable after installing it.' @"
 Two things usually cause this:
   1. The installer needs a new terminal. Close this window, open a new PowerShell, and run
-     this script again — it will skip straight past the install.
+     this script again -- it will skip straight past the install.
   2. The install genuinely failed. Download the LTS installer from https://nodejs.org,
-     run it yourself, then re-run this script.
+     run it yourself, then re-run this script. Behind a proxy, download it by hand.
 "@
+    return
   }
   Write-Ok "node $(& node --version)"
 }
@@ -143,6 +159,7 @@ if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
 npm ships with Node, so this usually means a partial install. Reinstall Node from
 https://nodejs.org, making sure "npm package manager" stays checked, then re-run.
 "@
+  return
 }
 Write-Ok "npm $(& npm --version)"
 
@@ -154,6 +171,7 @@ try {
   Invoke-WebRequest -Uri "$RawBase/setup.js" -OutFile $setup -UseBasicParsing
 } catch {
   Fail "Could not download setup.js: $($_.Exception.Message)" 'Check your network or proxy, then re-run.'
+  return
 }
 
 # A proxy or captive portal returning an HTML error page is a classic silent
@@ -161,6 +179,7 @@ try {
 $head = (Get-Content $setup -TotalCount 1 -ErrorAction SilentlyContinue)
 if ((Get-Item $setup).Length -lt 5KB -or $head -notmatch 'node') {
   Fail 'What downloaded is not setup.js.' 'Something on your network replaced the file. Try a different connection, or clone the repository manually.'
+  return
 }
 Write-Ok "$([math]::Round((Get-Item $setup).Length / 1KB)) KB"
 
@@ -176,11 +195,13 @@ if ($Doctor)      { $fwd += '--doctor' }
 if ($NoVerify)    { $fwd += '--no-verify' }
 
 if (-not $Key -and -not ($Status -or $Off -or $On -or $Uninstall -or $Doctor)) {
-  Write-Warn 'No OpenRouter key given. setup.js will ask for one.'
-  Write-Host '    Re-run as: ... -Key sk-or-v1-...' -ForegroundColor DarkGray
+  Write-Warn 'No OpenRouter key given, so the one already installed here is used, if there is one.'
+  Write-Host '    To use a new key: $env:OPENROUTER_API_KEY="sk-or-v1-..." before the install line' -ForegroundColor DarkGray
 }
 
 Write-Step 'Running setup'
 Write-Host ''
 & node $setup @fwd
-exit $LASTEXITCODE
+# As a file, pass on setup.js's exit code. Under iex, $LASTEXITCODE already
+# holds it, and exit would close the window this was pasted into.
+if ($PSCommandPath) { exit $LASTEXITCODE }

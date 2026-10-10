@@ -237,4 +237,12 @@ ok "$((size / 1024)) KB"
 
 step 'Running setup'
 echo
-node "$SETUP" "$@"
+# Under `curl ... | sh`, standard input is the pipe this script arrived on, and
+# setup.js hands it on to the Claude Code it starts at the end -- which needs a
+# terminal to read keys from, and stops with "Raw mode is not supported" when it
+# gets a pipe. Give it the terminal instead whenever there is one to open.
+if [ ! -t 0 ] && (exec < /dev/tty) 2>/dev/null; then
+  node "$SETUP" "$@" < /dev/tty
+else
+  node "$SETUP" "$@"
+fi

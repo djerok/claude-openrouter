@@ -189,10 +189,13 @@ The first time, Claude Code may ask you to pick a theme and accept its terms. Sa
 Type a question and press `Enter`. At the bottom of the screen you will see a line like:
 
 ```
-● mimo-v2.6-pro (default) | high | ccr-openrouter | main | $0.0002
+* mimo-v2.6-pro (default) | v381a74a cc 2.1.280 | high | my-project | main | $0.0002
 ```
 
-That is the statusline, and it is telling you the truth about which model answered.
+That is the statusline, and it is telling you the truth about which model answered. Right
+after the model are two versions: this setup's (`v381a74a`) and Claude Code's own
+(`cc 2.1.280`). Both update themselves. When the setup has updated while Claude Code was
+open, it says `(restart for v…)` — close Claude Code and open it again.
 
 > **The top of the screen may still show a Claude name.** That part of the screen is not
 > controlled by these settings. Trust the bottom line, not the top.
@@ -222,7 +225,7 @@ does, which is why one setup covered both.
 Same shape as the install — `npx` again, from any folder:
 
 ```sh
-npx --allow-git=root github:djerok/claude-openrouter --status      # what is routed where, is the router running
+npx --allow-git=root github:djerok/claude-openrouter --status      # what is routed where, which version, what updates itself
 npx --allow-git=root github:djerok/claude-openrouter --off         # switch back to your normal Anthropic account
 npx --allow-git=root github:djerok/claude-openrouter --on          # switch back to OpenRouter
 npx --allow-git=root github:djerok/claude-openrouter --uninstall   # undo everything, restore your original settings
@@ -253,6 +256,11 @@ That switches to Luna. `/model sonnet` puts you back on MiMo.
 | `npm install -g ... failed` on Windows | No permission to write to the global folder | Right-click PowerShell → **Run as Administrator**, then re-run the setup |
 | The statusline is blank or garbled | Your terminal cannot draw the symbols | Harmless. Windows users: use **Windows Terminal** rather than the old console window |
 | The header says "Sonnet" | Expected | Hardcoded in Claude Code. The bottom statusline is the real one |
+| A reply that is only markup, like `</｜DSML｜invoke>` | The model wrote a tool call out as text instead of making it, so nothing ran | The setup now asks the model to try again, once, by itself. If you still see it, ask again, or switch with `/model opus` |
+| A reply that is empty, after a tool ran | The model ended its turn without writing anything | Claude Code re-asks once by itself in current versions, which this setup now keeps up to date. Otherwise ask "what happened?" |
+| The spinner runs for minutes and nothing comes | The connection to the model died | It is dropped and retried after 2 minutes of silence. Or press `Esc` and ask again |
+| Statusline says `(restart for v…)` | This setup updated while Claude Code was open | Close Claude Code and open it again |
+| Statusline says `update failed` | The automatic update could not install | Run the install line from Step 4 again. It keeps your key |
 
 ### Ask the setup what is wrong
 
@@ -260,10 +268,10 @@ That switches to Luna. `/model sonnet` puts you back on MiMo.
 npx --allow-git=root github:djerok/claude-openrouter --doctor
 ```
 
-It changes nothing. It prints your Node and npm versions, whether Claude Code and the
-router are installed and actually runnable, which config files exist, whether the router is
-listening, and whether OpenRouter is reachable from your network. **It prints no keys**, so
-it is safe to paste into an issue.
+It changes nothing. It prints your Node and npm versions, whether Claude Code is installed
+and actually runnable, which config files exist, which version of this setup is installed,
+whether it and Claude Code are updating themselves, and whether OpenRouter is reachable from
+your network. **It prints no keys**, so it is safe to paste into an issue.
 
 Still stuck? Open an issue at
 <https://github.com/djerok/claude-openrouter/issues> and paste the full output — but **delete
